@@ -978,6 +978,15 @@ MAX_RECALL_ITEMS = 5
 #: Largest rendered recall section. The section it replaces had NO budget and
 #: reached 30,344 chars; a replacement without a bound would repeat that.
 DIALOGUE_RECALL_BUDGET_CHARS = 2_000
+#: The knowledge leg's OWN budget, ADDED to the recall total (it does not split the
+#: dialogue halves): at most MAX_KNOWLEDGE_RECALL_ITEMS titles, ~120 chars each plus
+#: its heading, so 1,000 leaves headroom. The section can now cost up to
+#: DIALOGUE_RECALL_BUDGET_CHARS + this, which is still far under the knowledge index
+#: (6,569 chars) the seam replaced.
+KNOWLEDGE_RECALL_BUDGET_CHARS = 1_000
+#: Item cap for the knowledge leg — below MAX_RECALL_ITEMS on purpose: it is a
+#: pointer list beside the dialogue halves, not a second result page.
+MAX_KNOWLEDGE_RECALL_ITEMS = 5
 #: When a section carries BOTH halves (query hits + newest summaries), each half
 #: gets this much of the budget, minus the two sub-headings that separate them.
 #: Split rather than shared, so a long hit list cannot squeeze the continuity
@@ -987,8 +996,9 @@ _RECALL_HALF_BUDGET_CHARS = (DIALOGUE_RECALL_BUDGET_CHARS - 90) // 2
 #: "matched what I asked" from "happened lately" without guessing.
 _RECALL_MATCHED_HEADING = "### Matched this query\n"
 _RECALL_NEWEST_HEADING = "### Newest remembered (continuity)\n"
+_RECALL_KNOWLEDGE_HEADING = "### Related knowledge (titles only)\n"
 
-_SECTION_BUDGETS = {"scratchpad": SCRATCHPAD_SECTION_BUDGET_CHARS, "identity": 80_000, "registry": 30_000, "world": 16_000, "dialogue_recall": DIALOGUE_RECALL_BUDGET_CHARS}
+_SECTION_BUDGETS = {"scratchpad": SCRATCHPAD_SECTION_BUDGET_CHARS, "identity": 80_000, "registry": 30_000, "world": 16_000, "dialogue_recall": DIALOGUE_RECALL_BUDGET_CHARS + KNOWLEDGE_RECALL_BUDGET_CHARS}
 
 
 def _warn_if_over_budget(name: str, content: str) -> None:
@@ -1060,6 +1070,13 @@ def _engram_recall_section(memory: Memory, query: str = "") -> str:
     Layer 1 only: one title line per hit, never a body. Bodies are what the
     `engram` tool is for, and shipping them here is how the removed 30 KB would
     come straight back.
+
+    A THIRD leg carries KNOWLEDGE on the same query, under its own sub-heading and
+    with its own budget (``KNOWLEDGE_RECALL_BUDGET_CHARS``) rather than a share of
+    the two dialogue halves — so the recall total can now cost up to
+    ``DIALOGUE_RECALL_BUDGET_CHARS + KNOWLEDGE_RECALL_BUDGET_CHARS``. It renders only
+    when it has titles, and only on the multi-word path: a one-word query keeps
+    exactly the shape it had before this leg existed.
     """
     from ouroboros.engram_cache import cached_read
     from ouroboros.engram_client import EngramConfigError
@@ -1130,9 +1147,33 @@ def _engram_recall_section(memory: Memory, query: str = "") -> str:
             # A multi-word query is natural language, and an OR hit set is keyword
             # OVERLAP — usually non-empty now, and no promise that the newest
             # summaries (the continuity anchor) are in it. Carry both halves.
+            # The THIRD leg, with its OWN budget rather than a share of the dialogue
+            # halves: durability the dialogue summaries do not carry (a recipe, a
+            # gotcha, a decision) surfaces on the same query. Titles only, and absent
+            # entirely when nothing matches — an empty sub-heading would cost bytes
+            # to say nothing.
+            knowledge = search_titles(
+                client,
+                text,
+                type_name="knowledge",
+                limit=MAX_KNOWLEDGE_RECALL_ITEMS,
+                max_chars=KNOWLEDGE_RECALL_BUDGET_CHARS,
+                match_mode="any",
+            )
+            extra = ""
+            if knowledge.readable and knowledge.status == "ok":
+                titles = str(knowledge.text or "").strip()
+                if titles:
+                    extra = "\n\n" + _RECALL_KNOWLEDGE_HEADING + titles
             newest = _newest(_RECALL_HALF_BUDGET_CHARS)
             if not (newest.readable and newest.status == "ok" and str(newest.text or "").strip()):
-                return found
+                return MachineRead(
+                    True,
+                    status="ok",
+                    count=int(found.count or 0),
+                    version=found.version,
+                    text=_RECALL_MATCHED_HEADING + hits + extra,
+                )
             # ADVISORY bookkeeping of the SEARCH half — `count` sums the two halves
             # (a record can be in both, so it can double-count) and `version`
             # describes only the search result. Nothing renders them today (they
@@ -1146,7 +1187,7 @@ def _engram_recall_section(memory: Memory, query: str = "") -> str:
                 version=found.version,
                 text=(
                     _RECALL_MATCHED_HEADING + hits + "\n\n"
-                    + _RECALL_NEWEST_HEADING + str(newest.text).strip()
+                    + _RECALL_NEWEST_HEADING + str(newest.text).strip() + extra
                 ),
             )
 
@@ -1154,7 +1195,9 @@ def _engram_recall_section(memory: Memory, query: str = "") -> str:
             "recall", client, _fetch,
             drive_root=memory.drive_root,
             key=str(query or ""),
-            max_chars=DIALOGUE_RECALL_BUDGET_CHARS,
+            # The cache cap must cover BOTH legs, or the knowledge part would be cut
+            # by the cache rather than by its own budget.
+            max_chars=DIALOGUE_RECALL_BUDGET_CHARS + KNOWLEDGE_RECALL_BUDGET_CHARS,
         )
         status, body, detail = read.status, read.text, read.detail
     except EngramConfigError:
@@ -1785,6 +1828,9 @@ def _capture_context_core(
         build_runtime_section(env, task, ctx=ctx),
         (
             "## Task Contract Discipline\n\n"
+            "Before planning, check `knowledge_read` and the `engram` tool for what is "
+            "already known about this work — retrieval is cheap and expected, and an "
+            "empty memory is not the default assumption. "
             "For non-trivial work, state your success criteria early in your plan or reasoning, "
             "then keep tool use, artifact production, and the final claim aligned with the "
             "visible task_contract. If task_acceptance_review is available and the work is "

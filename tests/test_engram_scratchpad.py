@@ -165,7 +165,10 @@ def test_the_review_pack_states_how_much_working_memory_it_saw(engram_stub):
     section = _engram_review_section(env.drive_root)
 
     assert "### Working memory in Engram (1 block(s))" in section
-    assert "Scratchpad block" in section
+    # The pack renders the mirror's TITLE, which is the block's own first line now —
+    # the constant "Scratchpad block (…)" is what this used to pin.
+    assert "the working note the review should see" in section
+    assert "Scratchpad block" not in section
     reset_sinks()
 
 
@@ -240,3 +243,104 @@ def test_type_digest_keeps_the_three_states_apart(engram_stub):
     state.fail = True
     down = type_digest(client_for(env), "scratchpad_block", window=50)
     assert not down.readable and down.status == "unavailable"
+
+
+# --------------------------------------------------------------------------- #
+# A2 — the mirror's title, and the one-shot re-title of what is already stored
+# --------------------------------------------------------------------------- #
+
+
+def test_the_mirror_title_is_the_blocks_own_first_line(engram_stub):
+    """A constant title made every mirrored block identical in a retrieval list."""
+    state, env = engram_stub
+    _append(env, "### [2026-09-12 — BG] recall leg landed\n\nbody text follows", source="bg")
+
+    blocks = _blocks(state)
+    assert len(blocks) == 1
+    assert blocks[0]["title"] == "### [2026-09-12 — BG] recall leg landed"
+    # The identity is the content fingerprint, so the title never enters it.
+    assert blocks[0]["topic_key"].startswith("scratchpad:")
+    reset_sinks()
+
+
+def test_the_title_helper_falls_back_when_a_block_has_no_line():
+    from ouroboros.memory import _scratchpad_block_title
+
+    assert _scratchpad_block_title({"content": "\n### real line\nmore"}, "bg") == "### real line"
+    # An empty title is REFUSED by the sink, and a refusal would drop the mirror.
+    assert _scratchpad_block_title({"content": "  \n\n"}, "bg") == "Scratchpad block (bg)"
+
+
+def test_the_one_shot_retitle_re_emits_the_same_records(engram_stub):
+    """Same identity => upserts: zero new records, and the local file is untouched."""
+    state, env = engram_stub
+    memory = Memory(env.drive_root, env.repo_dir)
+    for content in ("### first line A\n\nbody", "### first line B\n\nbody"):
+        memory.append_scratchpad_block(content, source="bg")
+    # Put the store back into its PRE-FIX shape: the constant title.
+    for record in state.knowledge.values():
+        if record.get("type") == "scratchpad_block":
+            record["title"] = "Scratchpad block (bg)"
+    before_ids = {record["id"] for record in _blocks(state)}
+    before_keys = {record["topic_key"] for record in _blocks(state)}
+    local_before = memory.scratchpad_blocks_path().read_text(encoding="utf-8")
+
+    tally = memory.retitle_scratchpad_mirrors()
+
+    after = _blocks(state)
+    assert tally["re_emitted"] == 2 and tally["already_retitled"] == 0
+    # Upsert by IDENTITY: the same records, no second row for any block.
+    assert len(after) == len(before_ids)
+    assert {record["topic_key"] for record in after} == before_keys
+    assert sorted(record["title"] for record in after) == ["### first line A", "### first line B"]
+    assert memory.scratchpad_blocks_path().read_text(encoding="utf-8") == local_before
+    reset_sinks()
+
+
+def test_the_retitle_batches_past_the_per_run_emit_cap(engram_stub):
+    """The C3 cap is 20 per run; a 25-block drive must still be fully re-titled."""
+    from ouroboros.engram_sink import MAX_EMITS_PER_RUN
+
+    state, env = engram_stub
+    memory = Memory(env.drive_root, env.repo_dir)
+    # Written directly: the live window is _SCRATCHPAD_MAX_BLOCKS (10) blocks, so a
+    # file bigger than the per-run cap can only come from an older bound — which is
+    # the case the batching exists for.
+    memory.scratchpad_blocks_path().write_text(
+        json.dumps([
+            {"ts": f"2026-09-12T00:{index:02d}:00+00:00", "source": "bg",
+             "content": f"### block {index:02d}\n\nbody"}
+            for index in range(MAX_EMITS_PER_RUN + 5)
+        ]),
+        encoding="utf-8",
+    )
+
+    tally = memory.retitle_scratchpad_mirrors()
+
+    assert tally["re_emitted"] == MAX_EMITS_PER_RUN + 5
+    assert len(_blocks(state)) == MAX_EMITS_PER_RUN + 5
+    reset_sinks()
+
+
+def test_the_retitle_is_self_terminating(engram_stub):
+    """A second run emits NOTHING: the marker names what was already re-titled.
+
+    Without this the packet runner would be an unmarked whole-set re-emit — the
+    "dedupe window == unacked window => re-push every boot" shape v6.114.22 removed.
+    """
+    state, env = engram_stub
+    memory = Memory(env.drive_root, env.repo_dir)
+    memory.append_scratchpad_block("### one\n\nbody", source="bg")
+    memory.append_scratchpad_block("### two\n\nbody", source="bg")
+
+    dry = memory.retitle_scratchpad_mirrors(dry_run=True)
+    assert dry["re_emitted"] == 0 and dry["already_retitled"] == 0 and dry["dry_run"] is True
+
+    first = memory.retitle_scratchpad_mirrors()
+    second = memory.retitle_scratchpad_mirrors()
+
+    assert first["re_emitted"] == 2
+    assert second["re_emitted"] == 0, "the second run must emit nothing"
+    assert second["already_retitled"] == 2
+    assert len(_blocks(state)) == 2, "no duplicate records"
+    reset_sinks()

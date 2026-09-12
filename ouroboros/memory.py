@@ -130,6 +130,26 @@ def _chat_history_snapshot_id(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _scratchpad_block_title(block: Dict[str, Any], source: str) -> str:
+    """The block's OWN first line, so a mirrored block is recognisable in a list.
+
+    The old constant ("Scratchpad block (task)") made every mirrored block
+    indistinguishable in a retrieval list — three of the five blocks in the live
+    recall window carried it. No identity prefix is added: the record's ``type`` is
+    already ``scratchpad_block`` and its topic key is ``scratchpad:<fingerprint>``,
+    so searchability does not depend on the title, while a prefix would spend the
+    title cap on a word the reader already has. The sink's ``_sanitize`` applies
+    ``FIELD_CAP_CHARS`` to whatever this returns.
+
+    Falls back to the old constant when the content has no non-empty line: an empty
+    title is refused by the sink, and a refusal would drop the mirror entirely.
+    """
+    for line in str(block.get("content") or "").splitlines():
+        if line.strip():
+            return line.strip()
+    return f"Scratchpad block ({source or 'task'})"
+
+
 def _scratchpad_block_fingerprint(block: Dict[str, Any]) -> str:
     """Stable identity for one scratchpad block, used as its Engram topic key.
 
@@ -322,7 +342,7 @@ class Memory:
             fingerprint = _scratchpad_block_fingerprint(block)
             receipt = sink_for(self).emit(
                 "memory_action",
-                title=f"Scratchpad block ({source or 'task'})",
+                title=_scratchpad_block_title(block, source),
                 content=str(block.get("content") or ""),
                 identity=f"scratchpad:{fingerprint}",
                 type="scratchpad_block",
@@ -340,6 +360,66 @@ class Memory:
         except Exception as exc:
             log.debug("Scratchpad Engram mirror failed", exc_info=True)
             return f"failed:{type(exc).__name__}"
+
+    def retitle_scratchpad_mirrors(self, *, batch: int = 20, dry_run: bool = False) -> Dict[str, Any]:
+        """Re-emit the scratchpad blocks whose Engram copy still carries the old title.
+
+        ONE-SHOT and SELF-TERMINATING: every block it re-titles has its fingerprint
+        recorded in ``state/scratchpad_retitle.json``, so a second run emits NOTHING.
+        The marker is written AFTER the emits (a crash re-runs only the unmarked
+        blocks, and the re-emit is an identity-keyed upsert either way).
+
+        Deliberately NOT a boot action: nothing depends on the titles being current,
+        and a per-boot re-emit of the whole set is exactly the "dedupe window ==
+        unacked window => re-push every start" shape v6.114.22 removed for the
+        dialogue blocks. The only caller is the packet runner
+        (``.ouroboros/engram-packet/retitle_scratchpad_blocks.py``, dry-run by
+        default), and it is nowhere near the boot path.
+
+        Batched through ``begin_engram_run`` because the per-run emit cap (C3) is 20
+        and a legacy file can hold more blocks than that. Returns a tally dict.
+        """
+        from ouroboros.engram_sink import begin_engram_run
+
+        marker_path = self.drive_root / "state" / "scratchpad_retitle.json"
+        done: set = set()
+        if marker_path.exists():
+            try:
+                payload = json.loads(marker_path.read_text(encoding="utf-8"))
+                done = {str(item) for item in (payload.get("retitled") or [])}
+            except Exception:
+                log.debug("Unreadable scratchpad re-title marker; treating as empty", exc_info=True)
+                done = set()
+
+        blocks = self.load_scratchpad_blocks()
+        todo = [b for b in blocks if _scratchpad_block_fingerprint(b) not in done]
+        tally: Dict[str, Any] = {
+            "blocks": len(blocks),
+            "already_retitled": len(blocks) - len(todo),
+            "re_emitted": 0,
+            "marker": str(marker_path),
+            "dry_run": bool(dry_run),
+        }
+        if not todo or dry_run:
+            return tally
+
+        sent = 0
+        size = max(1, int(batch))
+        for start in range(0, len(todo), size):
+            begin_engram_run(self)
+            for block in todo[start:start + size]:
+                status = self._mirror_block_to_engram(
+                    block, source=str(block.get("source") or "task"),
+                )
+                if status.startswith(("sent", "spooled")):
+                    sent += 1
+                    done.add(_scratchpad_block_fingerprint(block))
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(
+            json.dumps({"retitled": sorted(done)}, indent=0), encoding="utf-8",
+        )
+        tally["re_emitted"] = sent
+        return tally
 
     def regenerate_scratchpad_md(self) -> None:
         bp = self.scratchpad_blocks_path()

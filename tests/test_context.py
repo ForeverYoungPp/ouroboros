@@ -2162,3 +2162,51 @@ def test_delegation_fact_failure_never_drops_capability_digest(tmp_path, monkeyp
     # The surrounding digest survives intact.
     assert "allow_mutative_subagents" in capabilities
     assert "write_surfaces" in capabilities
+
+
+def test_the_prompt_tells_the_model_to_retrieve_before_planning(tmp_path):
+    """D — prompt-only: the planning seam names the retrieval tools, no gates."""
+    from ouroboros.context import build_llm_messages
+    from ouroboros.memory import Memory
+
+    class FakeEnv:
+        @property
+        def repo_dir(self):
+            return tmp_path / "repo"
+
+        @property
+        def drive_root(self):
+            return tmp_path
+
+        def drive_path(self, p):
+            return tmp_path / p
+
+        def repo_path(self, p):
+            return tmp_path / "repo" / p
+
+    (tmp_path / "repo" / "prompts").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "repo" / "docs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "memory" / "knowledge").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "repo" / "prompts" / "SYSTEM.md").write_text("System prompt", encoding="utf-8")
+    (tmp_path / "repo" / "BIBLE.md").write_text("Bible", encoding="utf-8")
+    (tmp_path / "repo" / "README.md").write_text("README", encoding="utf-8")
+    (tmp_path / "repo" / "docs" / "ARCHITECTURE.md").write_text("# Ouroboros v1.2.3", encoding="utf-8")
+    (tmp_path / "repo" / "docs" / "DEVELOPMENT.md").write_text("# Dev", encoding="utf-8")
+    (tmp_path / "repo" / "docs" / "CHECKLISTS.md").write_text("Checklist", encoding="utf-8")
+    (tmp_path / "repo" / "VERSION").write_text("1.2.3", encoding="utf-8")
+    (tmp_path / "repo" / "pyproject.toml").write_text('version = "1.2.3"', encoding="utf-8")
+    (tmp_path / "state" / "state.json").write_text('{"spent_usd": 0}', encoding="utf-8")
+    (tmp_path / "memory" / "identity.md").write_text("I am Ouroboros", encoding="utf-8")
+    (tmp_path / "memory" / "scratchpad.md").write_text("scratchpad", encoding="utf-8")
+
+    messages, _ = build_llm_messages(
+        env=FakeEnv(), memory=Memory(drive_root=tmp_path),
+        task={"id": "t", "type": "task", "text": "hello"},
+    )
+    dynamic_text = messages[0]["content"][2]["text"]
+
+    assert "## Task Contract Discipline" in dynamic_text
+    assert "Before planning, check `knowledge_read` and the `engram` tool" in dynamic_text
+    assert "empty memory is not the default assumption" in dynamic_text

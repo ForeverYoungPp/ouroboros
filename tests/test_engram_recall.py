@@ -636,3 +636,88 @@ def test_push_sends_one_emit_per_normalised_identity(engram_stub):
     assert len(stored) == 1
     assert "third pass" in str(stored[0]["content"])
     reset_sinks()
+
+
+# --------------------------------------------------------------------------- #
+# The knowledge leg — a THIRD budget line, not a split of the two dialogue halves
+# --------------------------------------------------------------------------- #
+
+
+def _seed_knowledge_rows(state, rows, *, start_id: int = 900) -> None:
+    for offset, (topic, title) in enumerate(rows):
+        record = {
+            "id": start_id + offset, "type": "knowledge", "title": title,
+            "topic_key": f"knowledge:{topic}", "scope": "global",
+            "content": f"{title} — full body the recall must not ship",
+            "created_at": "2026-01-01", "updated_at": "2026-01-02",
+        }
+        # Search only — deliberately NOT in `observations`, so the newest-block branch
+        # cannot render these and the knowledge leg is what is under test.
+        state.knowledge[record["id"]] = record
+
+
+def test_a_multi_word_query_renders_the_knowledge_leg(engram_stub):
+    from ouroboros.context import _RECALL_KNOWLEDGE_HEADING
+    from ouroboros.engram_cache import reset_cache
+
+    state, env = engram_stub
+    reset_cache()
+    _seed(state, [_block("2026-09-05 10:00 - 12:00", "the consolidator pipeline came up")])
+    _seed_knowledge_rows(state, [("consolidator", "consolidator pipeline notes")])
+    memory = Memory(env.drive_root, env.repo_dir)
+
+    section = _engram_recall_section(memory, "consolidator pipeline")
+
+    assert _RECALL_KNOWLEDGE_HEADING.strip() in section
+    assert "consolidator pipeline notes" in section
+    # Titles only, in this leg as in the others.
+    assert "full body the recall must not ship" not in section
+    reset_sinks()
+
+
+def test_the_knowledge_leg_is_absent_when_nothing_knowledge_matches(engram_stub):
+    from ouroboros.context import _RECALL_KNOWLEDGE_HEADING
+    from ouroboros.engram_cache import reset_cache
+
+    state, env = engram_stub
+    reset_cache()
+    _seed(state, [_block("2026-09-05 10:00 - 12:00", "we discussed the consolidator pipeline")])
+    _seed_knowledge_rows(state, [("unrelated-topic", "Metalworking notes")])
+    # (the dialogue block above carries the query verbatim, so the matched half renders)
+    memory = Memory(env.drive_root, env.repo_dir)
+
+    section = _engram_recall_section(memory, "consolidator pipeline")
+
+    # The dialogue half matched: the render is titles, so the HIT is what shows.
+    assert "### Matched this query" in section
+    assert "Dialogue summary: 2026-09-05" in section
+    assert _RECALL_KNOWLEDGE_HEADING.strip() not in section, (
+        "an empty knowledge sub-heading would cost bytes to say nothing"
+    )
+    reset_sinks()
+
+
+def test_each_recall_leg_stays_inside_its_own_budget(engram_stub):
+    from ouroboros.context import (
+        _RECALL_KNOWLEDGE_HEADING,
+        DIALOGUE_RECALL_BUDGET_CHARS,
+        KNOWLEDGE_RECALL_BUDGET_CHARS,
+    )
+    from ouroboros.engram_cache import reset_cache
+
+    state, env = engram_stub
+    reset_cache()
+    _seed(state, [_block(f"2026-09-{index:02d} 10:00 - 12:00", "recall knowledge " + "x" * 800)
+                  for index in range(1, 12)])
+    _seed_knowledge_rows(state, [(f"recall-{i}", "recall knowledge " + "y" * 600)
+                                 for i in range(12)])
+    memory = Memory(env.drive_root, env.repo_dir)
+
+    section = _engram_recall_section(memory, "recall knowledge")
+
+    assert _RECALL_KNOWLEDGE_HEADING.strip() in section
+    knowledge_block = section.split(_RECALL_KNOWLEDGE_HEADING, 1)[1]
+    assert len(knowledge_block) <= KNOWLEDGE_RECALL_BUDGET_CHARS + 200
+    # The dialogue halves keep their own 2,000-char budget; the total is the sum.
+    assert len(section) <= DIALOGUE_RECALL_BUDGET_CHARS + KNOWLEDGE_RECALL_BUDGET_CHARS + 400
+    reset_sinks()
