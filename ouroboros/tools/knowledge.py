@@ -928,9 +928,11 @@ def _knowledge_list(ctx: ToolContext) -> str:
     parts: List[str] = []
     if store_rows:
         header = (
-            f"ℹ️ STORE INDEX (Engram) — {len(store_rows)} topic(s) written since the local "
-            "write was retired; read one with `knowledge_read(topic=…)`. Durable memory "
-            "lives in Engram, so a name absent here was never written to the store.\n\n"
+            f"ℹ️ STORE INDEX (Engram) — {len(store_rows)} topic(s) written through the "
+            "knowledge tools since the local write was retired; read one with "
+            "`knowledge_read(topic=…)`. This is a WRITE-THROUGH index, so a topic absent "
+            "here was not written through this path — records another path put in the "
+            "store (the governance-doc mirror, for one) are there but not listed.\n\n"
         )
         if len(store_rows) >= KNOWLEDGE_INDEX_TOPIC_CAP:
             header += (

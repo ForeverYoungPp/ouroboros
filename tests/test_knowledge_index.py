@@ -298,6 +298,25 @@ def test_the_listing_keeps_the_archive_half_for_the_local_only_topics(tmp_path):
     assert "**patterns**" in listing, listing
 
 
+def test_the_listing_claims_only_what_the_write_through_index_knows(tmp_path):
+    """The listing must not over-claim about what is ABSENT from it.
+
+    The index is write-through: the governance-doc mirror writes to Engram through the
+    sink directly, so its records (312 on the live drive) exist in the store and are not
+    listed here. "a name absent here was never written to the store" was therefore
+    literally false — an absence claim stronger than the mechanism can support.
+    """
+    ctx = _Ctx(tmp_path / "drive")
+    _seed_history(ctx, _history_row("known-topic", "2026-09-12T00:00:00+00:00"))
+
+    listing = _knowledge_list(ctx)
+
+    assert "through the knowledge tools" in listing, "the scope of the index is named"
+    assert "WRITE-THROUGH index" in listing
+    assert "governance-doc mirror" in listing, "the bypasser is named, not implied"
+    assert "never written to the store" not in listing, "the over-claim must not return"
+
+
 def test_the_listing_still_renders_local_files_the_store_does_not_know(tmp_path):
     """A drive whose topic files predate the provenance log must not go blank."""
     ctx = _Ctx(tmp_path / "drive")
