@@ -1461,3 +1461,25 @@ def test_the_socket_transport_mismatch_is_named(monkeypatch):
     assert env_socket() == "/tmp/engram.sock"
     monkeypatch.delenv("ENGRAM_SOCKET", raising=False)
     assert env_socket() == ""
+
+
+def test_a_truncated_list_body_does_not_claim_a_bogus_offset(stub):
+    """A digest is a LIST of records: an offset into the joined text resumes nothing.
+
+    The offset note belongs to a single record's body; here the honest continuation
+    is a narrower query (or one record's body), and a fabricated resume point would
+    send the reader to a character index that addresses no record at all.
+    """
+    from ouroboros.engram_read import type_digest
+
+    state, env = stub
+    for index in range(40):
+        _seed_knowledge_recorded(
+            state, f"topic-{index:02d}", "y" * 400, obs_id=200 + index,
+        )
+
+    read = type_digest(client_for(env), "knowledge", limit=40, max_chars=300)
+
+    assert "truncated" in read.text
+    assert "offset=" not in read.text
+    assert "narrower query" in read.text

@@ -270,8 +270,12 @@ def _bounded_items(limit: Any, ceiling: int) -> int:
     return max(1, min(int(limit or ceiling), int(ceiling)))
 
 
-#: The `engram` tool's own read op — the default continuation surface.
+#: The `engram` tool's own read op — the surface for ONE record's text.
 _SURFACE_ENGRAM_READ = "op='read' offset={offset}"
+#: The surface for a RENDERED LIST of records (every `_bounded_body` caller). An
+#: offset into the joined text would point at nothing a reader could act on, so the
+#: note has to say what actually continues: a narrower query, or one record's body.
+_SURFACE_LIST = "a narrower query, or the engram tool's op='read' for a single record"
 
 
 def _truncation_note(shown: int, total: int, *, surface: str) -> str:
@@ -338,9 +342,11 @@ def _window_body(
     return head + window + note
 
 
-def _bounded_body(lines: List[str], max_chars: Any) -> str:
+def _bounded_body(lines: List[str], max_chars: Any, *, surface: str = _SURFACE_LIST) -> str:
+    """Bound a rendered LIST. The surface defaults to the list note, because an
+    offset into joined record lines names nothing a reader could resume."""
     budget = max(200, min(int(max_chars or MAX_DIGEST_CHARS), MAX_DIGEST_CHARS))
-    return _truncate_body("\n".join(lines), budget)
+    return _truncate_body("\n".join(lines), budget, surface=surface)
 
 
 def type_digest(
