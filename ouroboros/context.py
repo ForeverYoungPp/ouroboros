@@ -1004,6 +1004,13 @@ _RECALL_KNOWLEDGE_HEADING = "### Related knowledge (titles only)\n"
 #: index is ~4.8 K chars, so the budget binds only as the store grows, and when it does
 #: the omitted topics are NAMED with the path to the full index (never a silent clip).
 KNOWLEDGE_INDEX_BUDGET_CHARS = 4_000
+#: Bound for the `## Recent chat` section. Its tail cap is an ENTRY bound
+#: (`MAX_RECENT_CHAT_TAIL = 1000` rows), not a size one — so its worst case is a size:
+#: at the measured 2,993 B/row average (39,619 B max) a full tail renders ~1.5 MB. The
+#: measured ordinary render today is 53,113 chars over a 44-row suffix, so 64,000 sits
+#: ~20% above it: an ordinary turn renders byte-identically, while the pathological case
+#: is cut with a NAMED omission and a pointer to the full source (never a silent clip).
+RECENT_CHAT_BUDGET_CHARS = 64_000
 
 _SECTION_BUDGETS = {"scratchpad": SCRATCHPAD_SECTION_BUDGET_CHARS, "identity": 80_000, "registry": 30_000, "world": 16_000, "dialogue_recall": DIALOGUE_RECALL_BUDGET_CHARS + KNOWLEDGE_RECALL_BUDGET_CHARS}
 
@@ -1252,6 +1259,24 @@ def _engram_recall_section(memory: Memory, query: str = "") -> str:
     )
 
 
+def _recent_chat_omission_note(omitted_rows: int) -> str:
+    """The NAMED omission for the bounded ``## Recent chat`` render (BIBLE P1).
+
+    Names how many rows the BUDGET dropped (as opposed to the tail intent, which
+    ``Memory.summarize_chat`` reports itself) and where to read them: ``chat_history``
+    pages the same source this section renders, and the raw file is one ``read_file``
+    away.
+    """
+    if omitted_rows <= 0:
+        return ""
+    return (
+        f"\n\n_{omitted_rows} older chat row(s) are not shown here (budget "
+        f"{RECENT_CHAT_BUDGET_CHARS} chars). The full tail is readable with "
+        "`chat_history(count=…)`, or "
+        "`read_file(root='runtime_data', path='logs/chat.jsonl')`._"
+    )
+
+
 def build_memory_sections(memory: Memory, partition: str = "all", durable_dialogue_gaps_out: Optional[List[Dict[str, Any]]] = None, recall_query: str = "") -> List[str]:
     sections = []
 
@@ -1419,7 +1444,30 @@ def build_recent_sections(
         chat_coverage_out.update(chat_coverage)
     chat_summary = memory.summarize_chat(chat_entries, limit=_chat_tail)
     if chat_summary:
-        sections.append("## Recent chat\n\n" + chat_summary)
+        # BOUNDED, with a NAMED omission and a pointer to the full source — the
+        # `_knowledge_index_section` shape, because the tail cap above is an ENTRY bound
+        # and this section's worst case is a SIZE (see RECENT_CHAT_BUDGET_CHARS). The
+        # budget covers header + body + note, exactly as the index budget does, and the
+        # largest fitting entry limit is found by bisection so the render stays cheap.
+        header = "## Recent chat\n\n"
+        low, high = 1, max(1, min(len(chat_entries), _chat_tail))
+        while low < high:
+            mid = (low + high + 1) // 2
+            candidate = (
+                header
+                + memory.summarize_chat(chat_entries, limit=mid)
+                + _recent_chat_omission_note(max(0, len(chat_entries) - mid))
+            )
+            if len(candidate) <= RECENT_CHAT_BUDGET_CHARS:
+                low = mid
+            else:
+                high = mid - 1
+        omitted_rows = max(0, len(chat_entries) - low)
+        sections.append(
+            header
+            + memory.summarize_chat(chat_entries, limit=low)
+            + _recent_chat_omission_note(omitted_rows)
+        )
     if retained_project_origins:
         sections.append(
             "## Project owner origins (retention-proof bindings)\n\n"
@@ -1870,9 +1918,15 @@ def _capture_context_core(
         context_env, task_id=str(task.get("id") or "")
     )
     dynamic_parts = []
+    # PROMPT-CACHE HORIZON (2026-09-13): the system message is a PREFIX cache, so the
+    # last stable section must precede the first per-call one. Measured before this
+    # change: the live scratchpad sat at 89.8% of the message, and every byte after it
+    # could never hit the cache on a later call. Volatile sections are collected here and
+    # appended at the END — nothing is added, removed or reworded by this reorder.
+    volatile_parts: List[str] = []
     if health_section:
-        dynamic_parts.append(health_section)
-    dynamic_parts.extend(build_memory_sections(
+        volatile_parts.append(health_section)
+    volatile_parts.extend(build_memory_sections(
         context_memory,
         partition="volatile",
         # The owner's message is the natural retrieval query, and this is the
@@ -1895,9 +1949,7 @@ def _capture_context_core(
     knowledge_index = _knowledge_index_section(context_env)
     if knowledge_index:
         dynamic_parts.append(knowledge_index)
-    dynamic_parts.extend([
-        _drive_state_section(context_env),
-        build_runtime_section(env, task, ctx=ctx),
+    dynamic_parts.append(
         (
             "## Task Contract Discipline\n\n"
             "Before planning, check `knowledge_read` and the `engram` tool for what is "
@@ -1908,7 +1960,11 @@ def _capture_context_core(
             "visible task_contract. If task_acceptance_review is available and the work is "
             "non-trivial, effectful, headless, workspace, or delegated, call it before finalizing "
             "unless task review mode is off."
-        ),
+        )
+    )
+    volatile_parts.extend([
+        _drive_state_section(context_env),
+        build_runtime_section(env, task, ctx=ctx),
     ])
 
     try:
@@ -1960,7 +2016,7 @@ def _capture_context_core(
         _reflections_pid = resolve_project_id(task)
     except Exception:
         _reflections_pid = ""
-    dynamic_parts.extend(build_recent_sections(
+    volatile_parts.extend(build_recent_sections(
         context_memory, env, task_id=task.get("id", ""), thread_chat_id=int(task.get("chat_id") or 0),
         project_id=_reflections_pid,
     ))
@@ -1973,9 +2029,12 @@ def _capture_context_core(
             task_metadata.get("presence"),
         )
         if presence_section:
-            dynamic_parts.append(presence_section)
+            volatile_parts.append(presence_section)
     except Exception:
         log.debug("Failed to inject presence context", exc_info=True)
+
+    # The horizon: everything stable or low-frequency precedes every per-call section.
+    dynamic_parts.extend(volatile_parts)
 
     return _ContextCore(
         base_prompt=base_prompt,

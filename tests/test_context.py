@@ -708,7 +708,9 @@ class TestAdvisoryReviewStatusInContext:
         assert "### Historical review ledger" in dynamic_text
         assert "## Scratchpad" in dynamic_text
         assert dynamic_text.index("## Scratchpad") < dynamic_text.index("## Drive state")
-        assert dynamic_text.index("## Runtime context") < dynamic_text.index("## Review Continuity")
+        # RE-PINNED (2026-09-13 prompt-cache reorder): the stable continuity section now
+        # precedes the volatile runtime section, which is the horizon property.
+        assert dynamic_text.index("## Review Continuity") < dynamic_text.index("## Runtime context")
 
     def test_review_continuity_context_ignores_foreign_repo_obligations(self, tmp_path):
         from ouroboros.agent_task_pipeline import build_review_context
@@ -1759,7 +1761,7 @@ def test_installed_skills_section_includes_warnings_verdict(tmp_path, monkeypatc
     assert "warnings" in section
 
 
-def test_health_invariants_come_first_in_dynamic_context(tmp_path):
+def test_health_invariants_render_in_the_volatile_tail(tmp_path):
     from ouroboros.context import build_llm_messages
     from ouroboros.memory import Memory
 
@@ -1806,7 +1808,11 @@ def test_health_invariants_come_first_in_dynamic_context(tmp_path):
     )
 
     dynamic_text = messages[0]["content"][2]["text"]
-    assert dynamic_text.startswith("## Health Invariants")
+    # RE-PINNED (2026-09-13 prompt-cache reorder): the section must still render, but it
+    # now sits with the per-call volatile group — a stable section precedes it, and its
+    # order relative to the other volatile sections is unchanged.
+    assert "## Health Invariants" in dynamic_text
+    assert dynamic_text.index("## Task Contract Discipline") < dynamic_text.index("## Health Invariants")
     assert dynamic_text.index("## Health Invariants") < dynamic_text.index("## Drive state")
 
 
@@ -2251,3 +2257,107 @@ def test_the_prompt_tells_the_model_to_retrieve_before_planning(tmp_path):
     assert "## Task Contract Discipline" in dynamic_text
     assert "Before planning, check `knowledge_read` and the `engram` tool" in dynamic_text
     assert "empty memory is not the default assumption" in dynamic_text
+
+
+def test_the_volatile_sections_come_last(tmp_path):
+    """PROMPT-CACHE HORIZON: the last stable section precedes the first volatile one.
+
+    Prompt caching is PREFIX-based, so a per-call section sitting before a stable one caps
+    the cacheable prefix at that offset (measured before this reorder: the live scratchpad
+    held the horizon at 89.8% of the system message).
+    """
+    from ouroboros.context import build_llm_messages
+    from ouroboros.memory import Memory
+
+    class FakeEnv:
+        @property
+        def repo_dir(self):
+            return tmp_path / "repo"
+
+        @property
+        def drive_root(self):
+            return tmp_path
+
+        def drive_path(self, p):
+            return tmp_path / p
+
+        def repo_path(self, p):
+            return tmp_path / "repo" / p
+
+    (tmp_path / "repo" / "prompts").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "repo" / "docs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "memory" / "knowledge").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "repo" / "prompts" / "SYSTEM.md").write_text("System prompt", encoding="utf-8")
+    (tmp_path / "repo" / "BIBLE.md").write_text("Bible", encoding="utf-8")
+    (tmp_path / "repo" / "README.md").write_text("README", encoding="utf-8")
+    (tmp_path / "repo" / "docs" / "ARCHITECTURE.md").write_text("# Ouroboros v1.2.3", encoding="utf-8")
+    (tmp_path / "repo" / "docs" / "DEVELOPMENT.md").write_text("# Dev", encoding="utf-8")
+    (tmp_path / "repo" / "docs" / "CHECKLISTS.md").write_text("Checklist", encoding="utf-8")
+    (tmp_path / "repo" / "VERSION").write_text("1.2.3", encoding="utf-8")
+    (tmp_path / "repo" / "pyproject.toml").write_text('version = "1.2.3"', encoding="utf-8")
+    (tmp_path / "state" / "state.json").write_text('{"spent_usd": 0, "session_id": "s"}', encoding="utf-8")
+    (tmp_path / "memory" / "identity.md").write_text("I am Ouroboros", encoding="utf-8")
+    (tmp_path / "memory" / "scratchpad.md").write_text("scratchpad", encoding="utf-8")
+    (tmp_path / "logs" / "chat.jsonl").write_text(
+        json.dumps({"chat_id": 1, "direction": "in", "text": "hello"}) + "\n", encoding="utf-8")
+
+    messages, _ = build_llm_messages(
+        env=FakeEnv(), memory=Memory(drive_root=tmp_path),
+        task={"id": "t", "type": "task", "text": "hello"},
+    )
+    dynamic_text = messages[0]["content"][2]["text"]
+
+    stable = ("## Knowledge index (titles only)", "## Task Contract Discipline")
+    volatile = ("## Health Invariants", "## Scratchpad", "## Drive state",
+                "## Runtime context", "## Recent chat")
+    seen_stable = [dynamic_text.find(name) for name in stable if name in dynamic_text]
+    seen_volatile = [dynamic_text.find(name) for name in volatile if name in dynamic_text]
+
+    assert seen_stable, "the stable sections must render"
+    assert seen_volatile, "the volatile sections must render"
+    assert max(seen_stable) < min(seen_volatile), (
+        "a stable section rendered after a volatile one: "
+        f"{[(n, dynamic_text.find(n)) for n in stable + volatile if n in dynamic_text]}"
+    )
+
+
+def _recent_chat_section(tmp_path, rows):
+    from ouroboros.context import build_recent_sections
+    from ouroboros.memory import Memory
+
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state" / "state.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "logs" / "chat.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8",
+    )
+    memory = Memory(drive_root=tmp_path)
+    sections = build_recent_sections(memory, env=None)
+    section = next((s for s in sections if s.startswith("## Recent chat\n")), "")
+    return memory, section
+
+
+def test_recent_chat_is_bounded_with_a_named_omission(tmp_path):
+    """The tail cap is an ENTRY bound; the section's worst case is a SIZE. Bound it,
+    name the omission, point at the full source — the `_knowledge_index_section` shape."""
+    from ouroboros.context import RECENT_CHAT_BUDGET_CHARS
+
+    rows = [{"chat_id": 1, "direction": "in", "text": "y" * 4_000} for _ in range(60)]
+    _, section = _recent_chat_section(tmp_path, rows)
+
+    assert section, "the section must render"
+    assert len(section) <= RECENT_CHAT_BUDGET_CHARS
+    assert "older chat row(s) are not shown here (budget" in section
+    assert "chat_history(count=…)`" in section
+    assert "read_file(root='runtime_data', path='logs/chat.jsonl')" in section
+
+
+def test_an_ordinary_recent_chat_render_is_byte_identical(tmp_path):
+    """Under the budget the section is EXACTLY today's bytes: no note, no reshaping."""
+    rows = [{"chat_id": 1, "direction": "in", "text": f"row-{i}"} for i in range(5)]
+    memory, section = _recent_chat_section(tmp_path, rows)
+
+    entries, _ = memory.read_unconsolidated_chat(memory.load_dialogue_meta(), 1000)
+    assert section == "## Recent chat\n\n" + memory.summarize_chat(entries, limit=1000)
