@@ -796,6 +796,105 @@ def test_no_op_cleanup_skips_when_other_tasks_running_or_already_clean(tmp_path)
     assert tx3["cleanup_status"] == "skipped_no_base"
 
 
+def _publish_upstream(repo, origin, branch="ouroboros"):
+    """Create a bare origin, wire it as the remote and publish the branch."""
+    import subprocess
+
+    subprocess.run(["git", "init", "--bare", str(origin)], check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", str(origin)],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "push", "-u", "origin", branch],
+        check=True, capture_output=True, text=True,
+    )
+
+
+def test_cleanup_never_rewinds_the_branch_behind_its_published_line(tmp_path):
+    """A landing made on the branch while a cycle ran must SURVIVE that cycle's
+    cleanup. base_head sits below the published tip, so resetting to it would move
+    the LOCAL branch behind origin/ouroboros — the 2026-09-13T22:50:17Z incident,
+    where the owner's explicit manual landing left `ouroboros` minutes later while
+    origin still held a divergent tip. Nothing is touched, and the reason is
+    disclosed on the transaction."""
+    import subprocess
+
+    from supervisor import git_ops, queue
+
+    repo = tmp_path / "repo"
+    _git = _make_git_repo(repo)
+    base_head = _git("rev-parse", "HEAD").stdout.strip()
+
+    # The published line moved one commit above base; the branch was then rewound
+    # to base (an earlier cleanup) and a manual landing was committed on it.
+    (repo / "published.txt").write_text("published\n", encoding="utf-8")
+    _git("add", ".")
+    _git("commit", "-m", "published line")
+    git_ops.init(repo, tmp_path, "")
+    _publish_upstream(repo, tmp_path / "origin.git")
+    subprocess.run(
+        ["git", "-C", str(repo), "reset", "--hard", base_head],
+        check=True, capture_output=True, text=True,
+    )
+    (repo / "landing.txt").write_text("manual landing\n", encoding="utf-8")
+    _git("add", ".")
+    _git("commit", "-m", "fix(review): manual landing (v6.114.43)")
+    landed = _git("rev-parse", "HEAD").stdout.strip()
+
+    queue.init(tmp_path, 600, 1800)
+    queue.RUNNING.clear()
+    tx = {"transaction_id": "tx-published", "base_head": base_head}
+    lifecycle._cleanup_worktree_after_cycle(tx, "task-published")
+
+    assert tx["cleanup_status"] == "skipped_behind_upstream"
+    assert "origin/ouroboros" in tx["recovery_hint"]
+    assert "nothing stashed, nothing reset" in tx["recovery_hint"]
+    assert _git("rev-parse", "HEAD").stdout.strip() == landed
+    stashes = subprocess.run(
+        ["git", "-C", str(repo), "stash", "list"], capture_output=True, text=True
+    ).stdout.strip()
+    assert stashes == ""
+    branches = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--list", "evolution-leftover-*"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    assert branches == ""
+
+
+def test_cleanup_still_rewinds_an_unpublished_leftover_with_an_upstream(tmp_path):
+    """The published-line guard must not disable the cleanup's own case: an
+    unreviewed local leftover above an up-to-date base is still stashed and
+    preserved on a leftover ref, and the branch returns to base."""
+    import subprocess
+
+    from supervisor import git_ops, queue
+
+    repo = tmp_path / "repo"
+    _git = _make_git_repo(repo)
+    base_head = _git("rev-parse", "HEAD").stdout.strip()
+    git_ops.init(repo, tmp_path, "")
+    _publish_upstream(repo, tmp_path / "origin.git")
+
+    (repo / "leftover.txt").write_text("unreviewed\n", encoding="utf-8")
+    _git("add", ".")
+    _git("commit", "-m", "unreviewed leftover")
+    (repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+
+    queue.init(tmp_path, 600, 1800)
+    queue.RUNNING.clear()
+    tx = {"transaction_id": "tx-unpublished", "base_head": base_head}
+    lifecycle._cleanup_worktree_after_cycle(tx, "task-unpublished")
+
+    assert tx["cleanup_status"] == "reset_to_base"
+    assert tx["cleanup_preserved_ref"].startswith("evolution-leftover-")
+    assert _git("rev-parse", "HEAD").stdout.strip() == base_head
+    stashes = subprocess.run(
+        ["git", "-C", str(repo), "stash", "list"], capture_output=True, text=True
+    ).stdout.strip()
+    assert "evolution-cycle-cleanup-" in stashes
+
+
 def test_evolution_cleanup_never_mutates_checkout_owned_by_update(monkeypatch):
     from supervisor import git_ops, update_merge, workers
 

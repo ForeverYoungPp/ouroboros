@@ -13,7 +13,7 @@ import logging
 import os
 import pathlib
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from ouroboros.evolution_checkpoints import uncommitted_cycle_outcome
 from ouroboros.evolution_fingerprint import canonical_objective_fingerprint
@@ -796,6 +796,35 @@ def update_evolution_transaction(task_id: str, **updates: Any) -> bool:
         state.release_file_lock(state.STATE_LOCK_PATH, lock_fd)
 
 
+def _rewind_is_safe_against_published_line(base_head: str) -> Tuple[bool, str]:
+    """May the cycle cleanup reset the branch to ``base_head``?
+
+    The cleanup exists to stop UNREVIEWED leftovers leaking into the next
+    cycle, and it may rewind only a workspace it owns. ``base_head`` stops
+    being a private base once the branch has a PUBLISHED line above it: the
+    reset then moves the local branch silently BEHIND its own upstream. That is
+    how a landing made during a cycle (2026-09-13T22:50:17Z, on the owner's
+    explicit manual-landing instruction) left ``ouroboros`` minutes later while
+    ``origin/ouroboros`` still held a divergent tip, and every following cycle
+    then planned and committed against a stale base.
+
+    Returns ``(safe, upstream_ref)``. A checkout with no upstream (a scratch or
+    test repository) keeps the historical behaviour.
+    """
+    from supervisor import git_ops
+
+    rc, upstream_out, _ = git_ops.git_capture(
+        ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]
+    )
+    upstream = upstream_out.strip() if rc == 0 else ""
+    if not upstream:
+        return True, ""
+    rc_ancestor, _, _ = git_ops.git_capture(
+        ["git", "merge-base", "--is-ancestor", upstream, base_head]
+    )
+    return rc_ancestor == 0, upstream
+
+
 def _cleanup_worktree_after_cycle(tx: Dict[str, Any], task_id: str) -> None:
     """Deterministic worktree cleanup when a cycle closes WITHOUT absorption.
 
@@ -869,6 +898,23 @@ def _cleanup_worktree_after_cycle(tx: Dict[str, Any], task_id: str) -> None:
         if not dirty and head == base_head:
             tx["cleanup_status"] = "already_clean"
             return
+
+        if head != base_head:
+            rewind_safe, upstream_ref = _rewind_is_safe_against_published_line(base_head)
+            if not rewind_safe:
+                # The branch tip is no longer this transaction's private
+                # workspace: resetting to base_head would leave the LOCAL branch
+                # behind its published line. Touch nothing — not even the stash —
+                # and say so (P1: a moved published line outranks our tidy base).
+                tx["cleanup_status"] = "skipped_behind_upstream"
+                tx["cleanup_head"] = head
+                tx["recovery_hint"] = (
+                    f"HEAD {head[:12]} is not this cycle's commit and {upstream_ref} is not an "
+                    f"ancestor of base {base_head[:12]}: resetting would leave the branch behind "
+                    "its published line. Left as-is (nothing stashed, nothing reset); reconcile "
+                    "the branch with its upstream before the next cycle."
+                )
+                return
 
         if dirty:
             stash_label = f"evolution-cycle-cleanup-{tx.get('transaction_id') or task_id}"
