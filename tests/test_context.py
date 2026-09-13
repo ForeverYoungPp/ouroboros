@@ -2312,9 +2312,11 @@ def test_the_volatile_sections_come_last(tmp_path):
     )
     dynamic_text = messages[0]["content"][2]["text"]
 
-    stable = ("## Knowledge index (titles only)", "## Task Contract Discipline")
-    volatile = ("## Health Invariants", "## Scratchpad", "## Drive state",
-                "## Runtime context", "## Recent chat")
+    stable = ("## Task Contract Discipline",)
+    # The knowledge index moved here: its rows carry `— updated <date>` (tools/knowledge.py:215),
+    # so one topic write moves the section and any stable bytes after it are lost to the cache.
+    volatile = ("## Knowledge index (titles only)", "## Health Invariants", "## Scratchpad",
+                "## Drive state", "## Runtime context", "## Recent chat")
     seen_stable = [dynamic_text.find(name) for name in stable if name in dynamic_text]
     seen_volatile = [dynamic_text.find(name) for name in volatile if name in dynamic_text]
 

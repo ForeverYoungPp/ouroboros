@@ -1939,6 +1939,23 @@ def _capture_context_core(
     # could never hit the cache on a later call. Volatile sections are collected here and
     # appended at the END — nothing is added, removed or reworded by this reorder.
     volatile_parts: List[str] = []
+    # The tier-0 knowledge index (BIBLE.md:116-118), MAIN CHAT ONLY: the write-through
+    # store index replaces the derived-learning input this assembly deliberately dropped
+    # (`include_derived_knowledge=False` at the `build_knowledge_sections` call above),
+    # and is what makes a topic nameable at all. It is not gated by that flag — the flag
+    # governs the retired LOCAL archive index, this is its replacement. BG keeps the
+    # un-gated archive index it already renders through its own builder call.
+    #
+    # VOLATILE group, not the stable one: every row carries its own `— updated <date>` and
+    # a spooled/refused status (tools/knowledge.py:215), so ONE topic write moves this
+    # section — and a section that moves drags the cacheable prefix back to it. The dates
+    # STAY (they are the freshness a reader needs, BIBLE P1: relocate, never delete a fact
+    # the prompt owes its reader). It is the least volatile member of this group — it
+    # changes per write, not per call — so it goes FIRST among the volatile sections:
+    # everything that never changes now precedes the horizon.
+    knowledge_index = _knowledge_index_section(context_env)
+    if knowledge_index:
+        volatile_parts.append(knowledge_index)
     if health_section:
         volatile_parts.append(health_section)
     volatile_parts.extend(build_memory_sections(
@@ -1955,15 +1972,6 @@ def _capture_context_core(
     installed_skills = _build_installed_skills_section(context_env)
     if installed_skills:
         dynamic_parts.append(installed_skills)
-    # The tier-0 knowledge index (BIBLE.md:116-118), MAIN CHAT ONLY: the write-through
-    # store index replaces the derived-learning input this assembly deliberately dropped
-    # (`include_derived_knowledge=False` at the `build_knowledge_sections` call above),
-    # and is what makes a topic nameable at all. It is not gated by that flag — the flag
-    # governs the retired LOCAL archive index, this is its replacement. BG keeps the
-    # un-gated archive index it already renders through its own builder call.
-    knowledge_index = _knowledge_index_section(context_env)
-    if knowledge_index:
-        dynamic_parts.append(knowledge_index)
     dynamic_parts.append(
         (
             "## Task Contract Discipline\n\n"
