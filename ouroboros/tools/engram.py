@@ -201,6 +201,12 @@ def _engram(
             return _unavailable(result)
         items = result.items()
         if not items:
+            if not result.items_decodable():
+                return (
+                    f"ENGRAM SEARCH UNPARSED — the store answered 200 for {query!r} but the body "
+                    "did not carry a shape this decoder understands, so nothing was read. This is "
+                    "NOT 'no candidate memories': the answer was never decoded."
+                )
             return f"No candidate memories for {query!r} in project {client.config.project!r}."
         lines = [_one_line(item) for item in items[:MAX_SEARCH_LIMIT]]
         out = _bounded(
@@ -232,13 +238,36 @@ def _engram(
                 "Re-find it with op='search' (a search can match records outside this project), "
                 "then op='read' the id it returns."
             )
-        items = result.items()
-        if not items:
-            return f"No timeline around observation {observation_id}."
-        out = _bounded(
-            [f"Neighbourhood of observation {observation_id}:", *[_one_line(i) for i in items]],
-            MAX_TIMELINE_OUTPUT_CHARS,
-        )
+        neighbourhood = result.timeline_neighbourhood()
+        if neighbourhood is None:
+            return (
+                f"ENGRAM TIMELINE UNPARSED — the store answered 200 for observation "
+                f"{int(observation_id)} (status={getattr(result, 'status', None)}, project "
+                f"{client.config.project!r}) but the body did not carry the /timeline shape (an "
+                "object with focus/before/after), so no neighbourhood was decoded. This is NOT "
+                "'no neighbourhood': the answer was never read. Use op='read' on this id for the "
+                "record itself."
+            )
+        focus = neighbourhood["focus"]
+        before = neighbourhood["before"]
+        after = neighbourhood["after"]
+        if not (focus or before or after):
+            return (
+                f"No neighbourhood around observation {int(observation_id)} — the store answered "
+                f"200 with no focus record and no before/after rows in project "
+                f"{client.config.project!r}. Re-find it with op='search', then op='read' the id "
+                "it returns."
+            )
+        header = f"Neighbourhood of observation {int(observation_id)}"
+        total = neighbourhood["total_in_range"]
+        if isinstance(total, int):
+            header += f" ({total} records in this range)"
+        lines = [header + ":"]
+        lines += [f"  before | {_one_line(row)}" for row in before]
+        if focus:
+            lines.append(f"  focus  | {_one_line(focus)}")
+        lines += [f"  after  | {_one_line(row)}" for row in after]
+        out = _bounded(lines, MAX_TIMELINE_OUTPUT_CHARS)
         _spend(ctx, chars=len(out))
         return out
 

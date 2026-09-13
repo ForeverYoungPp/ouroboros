@@ -130,14 +130,31 @@ def test_empty_search_is_not_confused_with_unavailable(stub):
 
 
 def test_timeline_shows_the_neighbourhood_without_bodies(stub):
+    """The payload below is the shape MEASURED from the running service.
+
+    ``GET /timeline`` answers an object carrying ``focus``/``before``/``after`` — never
+    a flat list. The previous version of this test fed a bare list, which the generic
+    ``items()`` scan happens to decode, so the route's real shape was never exercised
+    and the tool answered "No timeline around observation N" in production for a 200 it
+    had not parsed. Keep this payload in the SERVER's shape, not the decoder's.
+    """
     state, ctx = stub
-    state.payloads["/timeline"] = [
-        {"id": 9, "type": "discovery", "title": "before", "content": "NO-BODY"},
-        {"id": 10, "type": "decision", "title": "the hit", "content": "NO-BODY"},
-    ]
+    state.payloads["/timeline"] = {
+        "focus": {"id": 10, "type": "decision", "title": "the hit",
+                  "created_at": "2026-01-02", "content": "NO-BODY"},
+        "before": [{"id": 9, "type": "discovery", "title": "before",
+                    "created_at": "2026-01-01", "content": "NO-BODY"}],
+        "after": [{"id": 11, "type": "bugfix", "title": "after",
+                   "created_at": "2026-01-03", "content": "NO-BODY"}],
+        "session_info": {},
+        "total_in_range": 42,
+    }
     out = engram_tool._engram(ctx, op="timeline", observation_id=10, before=3, after=3)
     assert "Neighbourhood of observation 10" in out
     assert "[10] (decision) the hit" in out
+    assert "[9] (discovery) before" in out
+    assert "[11] (bugfix) after" in out
+    assert "42 records in this range" in out
     assert "NO-BODY" not in out
 
 
@@ -152,6 +169,41 @@ def test_timeline_radius_is_clamped(stub):
 def test_timeline_needs_an_id(stub):
     _, ctx = stub
     assert "needs an `observation_id`" in engram_tool._engram(ctx, op="timeline")
+
+
+def test_timeline_unparsed_body_is_not_reported_as_an_absent_neighbourhood(stub):
+    """A 200 whose body is not the route's shape must never read as 'no neighbourhood'.
+
+    This is the defect that made layer 2 useless for its whole life: the tool collapsed
+    "the store answered and holds no neighbourhood" with "the store answered and the body
+    did not parse" into one sentence asserting the first.
+    """
+    state, ctx = stub
+    state.payloads["/timeline"] = {"unexpected": "shape"}
+    out = engram_tool._engram(ctx, op="timeline", observation_id=10)
+    assert "UNPARSED" in out
+    assert "not 'no neighbourhood'" in out.lower()
+    assert "No neighbourhood around" not in out
+
+
+def test_timeline_genuinely_empty_neighbourhood_is_a_distinct_answer(stub):
+    """The route shape IS present and carries nothing — that absence is now a real fact."""
+    state, ctx = stub
+    state.payloads["/timeline"] = {
+        "focus": None, "before": [], "after": None, "total_in_range": 0,
+    }
+    out = engram_tool._engram(ctx, op="timeline", observation_id=10)
+    assert "No neighbourhood around observation 10" in out
+    assert "UNPARSED" not in out
+
+
+def test_search_unparsed_body_is_not_reported_as_no_candidates(stub):
+    """The same collapse one layer up: an undecoded search must not read as empty."""
+    state, ctx = stub
+    state.payloads["/search"] = {"unexpected": "shape"}
+    out = engram_tool._engram(ctx, op="search", query="x")
+    assert "UNPARSED" in out
+    assert "No candidate memories" not in out
 
 
 # --------------------------------------------------------------------------- #

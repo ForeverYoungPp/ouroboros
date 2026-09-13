@@ -156,11 +156,66 @@ class EngramResult:
         if isinstance(self.data, list):
             return [x for x in self.data if isinstance(x, dict)]
         if isinstance(self.data, dict):
-            for key in ("observations", "relations", "sessions", "prompts", "items", "results"):
+            for key in self.GENERIC_ITEM_KEYS:
                 value = self.data.get(key)
                 if isinstance(value, list):
                     return [x for x in value if isinstance(x, dict)]
         return []
+
+    #: The keys :meth:`items` can decode. A 200 carrying none of them is a shape this
+    #: scanner does not understand — which is a DIFFERENT fact from an empty
+    #: collection, and collapsing the two is how a live route came to answer 200 and
+    #: be reported as a factual absence. ``GET /timeline`` is that route: it answers
+    #: with a FOCUS record plus two ordered neighbourhood lists, so the scan found no
+    #: key it knew, returned ``[]``, and the caller announced "no neighbourhood" for a
+    #: payload it had never parsed.
+    GENERIC_ITEM_KEYS = ("observations", "relations", "sessions", "prompts", "items", "results")
+
+    #: The keys ``GET /timeline`` answers with — its own contract, deliberately not a
+    #: flat collection, and therefore parsed by its own route shape rather than by the
+    #: generic scan above.
+    TIMELINE_PAYLOAD_KEYS = ("focus", "before", "after")
+
+    def items_decodable(self) -> bool:
+        """Whether this body is a shape :meth:`items` understands at all.
+
+        ``False`` means *not decoded* — never *empty*. A caller that would otherwise
+        render an absence must disclose that the answer was never read.
+        """
+        if isinstance(self.data, list):
+            return True
+        if isinstance(self.data, dict):
+            return any(key in self.data for key in self.GENERIC_ITEM_KEYS)
+        return False
+
+    def timeline_neighbourhood(self) -> Optional[Dict[str, Any]]:
+        """Route-specific parse of a ``GET /timeline`` body, or ``None`` when it is not that shape.
+
+        Returns ``{"focus": dict|None, "before": [...], "after": [...],
+        "total_in_range": int|None}`` — the focus record, marked apart from its two
+        ordered neighbourhood lists, because the route answers in that shape and not as
+        one flat collection.
+
+        A ``None`` return means the 200 carried a body this route's contract does not
+        describe, and the caller must disclose THAT rather than report an empty
+        neighbourhood: an unparsed answer and an absent one are different facts.
+        """
+        if not isinstance(self.data, dict):
+            return None
+        if not any(key in self.data for key in self.TIMELINE_PAYLOAD_KEYS):
+            return None
+
+        def _rows(value: Any) -> List[Dict[str, Any]]:
+            return [x for x in value if isinstance(x, dict)] if isinstance(value, list) else []
+
+        focus = self.data.get("focus")
+        total = self.data.get("total_in_range")
+        return {
+            "focus": focus if isinstance(focus, dict) else None,
+            "before": _rows(self.data.get("before")),
+            "after": _rows(self.data.get("after")),
+            "total_in_range": total if isinstance(total, int) else None,
+        }
 
     def one(self) -> Optional[Dict[str, Any]]:
         return self.data if isinstance(self.data, dict) else None
