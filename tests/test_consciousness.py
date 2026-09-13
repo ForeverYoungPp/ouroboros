@@ -407,6 +407,11 @@ def test_an_over_ceiling_cycle_rebuilds_on_the_low_projection_and_records_it(eng
     # 3. And the deviation is disclosed under its own reason.
     degraded = [e for e in events() if e.get("type") == "consciousness_context_degraded"]
     assert degraded and degraded[0]["reason"] == "task_local_low"
+    # The receipt must carry the measurement that TRIMMED the ceiling, not just
+    # the post-degradation one: distinguishable numbers, or the guard stays unreadable.
+    assert degraded[0]["physical_bytes_before"] == BG_CONTEXT_MAX_CHARS + 500
+    assert degraded[0]["physical_bytes"] == 1_000
+    assert degraded[0]["physical_bytes_before"] != degraded[0]["physical_bytes"]
     assert not [e for e in events() if e.get("type") == "consciousness_context_overflow"]
     assert [e for e in events() if e.get("type") == "consciousness_thought"], "the cycle did not finish"
 

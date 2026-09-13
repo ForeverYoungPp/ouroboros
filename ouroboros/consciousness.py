@@ -850,6 +850,7 @@ class BackgroundConsciousness:
                         reasoning_effort=effort,
                     )
                     if physical_chars > BG_CONTEXT_MAX_CHARS:
+                        physical_bytes_before = physical_chars
                         if not degraded_for_size and self._degrade_context_for_size(
                             messages, observation_snapshot,
                             provider=str(target.get("provider") or ""),
@@ -868,6 +869,7 @@ class BackgroundConsciousness:
                                     "ts": utc_now_iso(),
                                     "type": "consciousness_context_degraded",
                                     "physical_bytes": physical_chars,
+                                    "physical_bytes_before": physical_bytes_before,
                                     "reason": "task_local_low",
                                 },
                                 label="context degraded",

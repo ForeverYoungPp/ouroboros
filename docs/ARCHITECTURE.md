@@ -1,4 +1,4 @@
-# Ouroboros v6.114.40 — Architecture & Reference
+# Ouroboros v6.114.41 — Architecture & Reference
 
 This file is NOT a changelog. Version history lives in README.md, git tags, and commit log.
 
