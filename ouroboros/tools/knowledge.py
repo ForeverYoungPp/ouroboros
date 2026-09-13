@@ -91,16 +91,21 @@ def _valid_topic_or_empty(topic: Any) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _history_path(ctx: ToolContext) -> Path:
-    """The provenance log this index is seeded from — same dir, same expression."""
-    return _knowledge_dir(ctx).parent / "knowledge_history.jsonl"
+def _history_path(knowledge_dir: Path) -> Path:
+    """The provenance log this index is seeded from — beside the knowledge dir."""
+    return knowledge_dir.parent / "knowledge_history.jsonl"
+
+
+def _index_ledger_path_for(knowledge_dir: Path) -> Path:
+    """The store-side ledger beside one knowledge dir (global or per-project)."""
+    return knowledge_dir.parent / INDEX_LEDGER
 
 
 def _index_ledger_path(ctx: ToolContext) -> Path:
-    return _knowledge_dir(ctx).parent / INDEX_LEDGER
+    return _index_ledger_path_for(_knowledge_dir(ctx))
 
 
-def _index_rows_from_history(ctx: ToolContext) -> List[dict]:
+def _index_rows_from_history(knowledge_dir: Path) -> List[dict]:
     """Newest row per topic, reconstructed from the provenance log. Never raises.
 
     This is what makes the index useful on a drive that predates it: the log already
@@ -109,7 +114,7 @@ def _index_rows_from_history(ctx: ToolContext) -> List[dict]:
     window read or a server change to name them. Rows the log cannot describe
     (patterns/index-full, which are local-only by ruling) are left to the archive.
     """
-    path = _history_path(ctx)
+    path = _history_path(knowledge_dir)
     if not path.exists():
         return []
     rows: dict[str, dict] = {}
@@ -176,6 +181,24 @@ def _index_rows_from_ledger(path: Path) -> List[dict]:
     return list(rows.values())
 
 
+def _index_rows_for_dir(knowledge_dir: Path) -> List[dict]:
+    """Newest row per topic for ONE knowledge dir (global or per-project), newest first.
+
+    The dir is the seam: a caller that already resolved it (the prompt builder, which
+    renders either the global or the active project's index) needs the same rows the
+    ctx-driven reader produces, without inventing a ctx for a dir it holds.
+    """
+    path = _index_ledger_path_for(knowledge_dir)
+    rows = (
+        _index_rows_from_ledger(path)
+        if path.exists()
+        else _index_rows_from_history(knowledge_dir)
+    )
+    rows = [r for r in rows if str(r.get("topic") or "") not in LOCAL_ARCHIVE_TOPICS]
+    rows.sort(key=lambda r: (str(r.get("ts") or ""), str(r.get("topic") or "")), reverse=True)
+    return rows
+
+
 def knowledge_index_rows(ctx: ToolContext) -> List[dict]:
     """Newest row per topic, newest first — the ONE reader both surfaces use.
 
@@ -184,15 +207,7 @@ def knowledge_index_rows(ctx: ToolContext) -> List[dict]:
     that has never written since this feature landed. Reads only: no file is created
     here, which is what lets ``knowledge_list`` stay a POLICY_SKIP read.
     """
-    path = _index_ledger_path(ctx)
-    rows = (
-        _index_rows_from_ledger(path)
-        if path.exists()
-        else _index_rows_from_history(ctx)
-    )
-    rows = [r for r in rows if str(r.get("topic") or "") not in LOCAL_ARCHIVE_TOPICS]
-    rows.sort(key=lambda r: (str(r.get("ts") or ""), str(r.get("topic") or "")), reverse=True)
-    return rows
+    return _index_rows_for_dir(_knowledge_dir(ctx))
 
 
 def knowledge_index_line(row: dict) -> str:
@@ -207,6 +222,85 @@ def knowledge_index_line(row: dict) -> str:
     elif status in ("refused", "failed", "capped", "no_receipt"):
         line += f" ({status or 'not in Engram'})"
     return line
+
+
+#: Heading for the union's store half (see ``knowledge_index_union_body``). The archive
+#: entries above it carry a summary each; these rows are names only, and the heading is
+#: what tells the reader which is which without decoding the row shape.
+STORE_TITLES_HEADING = "### Store topics (titles only — no archive entry)\n\n"
+
+
+def knowledge_index_union_body(
+    archive_path: Path,
+    archive_text: str,
+    *,
+    budget: int,
+    drive_root: Path | None = None,
+) -> str:
+    """The background lane's knowledge body: the archive's entries PLUS the store's names.
+
+    ``index-full.md`` froze when the canonical local write was retired, so any lane that
+    renders it alone cannot NAME a topic written since (the gap ``_knowledge_index_section``
+    closes for the main chat). This keeps every archive entry — its per-topic summary is
+    the value — and adds ONE line per store topic the archive does not already carry, so a
+    topic in both is listed once, with its summary. It reads through the same rows resolver
+    and the same entry parser ``knowledge_list`` uses, so the two surfaces cannot disagree
+    about which topics exist.
+
+    ``budget`` bounds the STORE half only: that half grows with every write, while the
+    archive is frozen at the switch and already resident in this lane. An overflow drops
+    the oldest rows and NAMES how many, pointing at the full store index (P1: bounded
+    projection, disclosed omission, never a silent clip).
+    """
+    rows = _index_rows_for_dir(archive_path.parent)
+    if not rows:
+        return archive_text
+    archived = {
+        topic
+        for topic in (index_entry_topic(line) for line in archive_text.splitlines())
+        if topic
+    }
+    lines = [
+        knowledge_index_line(row)
+        for row in rows
+        if str(row.get("topic") or "") not in archived
+    ]
+    if not lines:
+        return archive_text
+
+    source = _index_ledger_path_for(archive_path.parent)
+    if not source.exists():
+        source = _history_path(archive_path.parent)
+    where = str(source)
+    if drive_root is not None:
+        try:
+            where = str(source.relative_to(drive_root))
+        except ValueError:
+            pass
+    base_note = (
+        f"The store index holds {len(rows)} topic(s) written through the knowledge tools "
+        f"since the local write was retired; the {len(lines)} above have no archive entry, so "
+        "they are names only (`knowledge_read(topic=…)` reads one). A topic with an archive "
+        f"entry keeps its summary there. Full store index: `{where}`."
+    )
+
+    def _render(shown: int) -> str:
+        note = base_note
+        if shown < len(lines):
+            note += (
+                f" {len(lines) - shown} older topic(s) are not listed here (budget "
+                f"{budget} chars)."
+            )
+        body = "\n".join(lines[:shown])
+        if not body:
+            return f"{STORE_TITLES_HEADING.rstrip()}\n\n{note}"
+        return f"{STORE_TITLES_HEADING}{body}\n\n{note}"
+
+    shown = len(lines)
+    while shown > 0 and len(_render(shown)) > budget:
+        shown -= 1
+    block = _render(shown)
+    return f"{archive_text.rstrip()}\n\n{block}" if archive_text.strip() else block
 
 
 def _index_write_rows(path: Path, rows: List[dict]) -> bool:
@@ -236,7 +330,7 @@ def _index_seed(ctx: ToolContext) -> None:
     path = _index_ledger_path(ctx)
     if path.exists():
         return
-    rows = _index_rows_from_history(ctx)
+    rows = _index_rows_from_history(_knowledge_dir(ctx))
     if not rows:
         return
     _index_write_rows(path, rows)
@@ -901,8 +995,13 @@ def _engram_list_note(ctx: ToolContext) -> str:
 _INDEX_ENTRY_RE = re.compile(r"^- \*\*([^:*]+)\*\*")
 
 
-def _index_entry_topic(line: str) -> str:
-    """The topic an ``index-full.md`` entry line names, else ``""`` (other lines)."""
+def index_entry_topic(line: str) -> str:
+    """The topic an ``index-full.md`` entry line names, else ``""`` (other lines).
+
+    Public because two readers must agree on which topics the archive already carries:
+    ``_knowledge_list`` (which drops the archive rows the store index knows) and the
+    background lane's union body (which adds only the store rows the archive does not).
+    """
     match = _INDEX_ENTRY_RE.match(line.strip())
     return _valid_topic_or_empty(match.group(1)) if match else ""
 
@@ -945,7 +1044,7 @@ def _knowledge_list(ctx: ToolContext) -> str:
         kept = [
             line
             for line in index_path.read_text(encoding="utf-8").splitlines()
-            if _index_entry_topic(line) not in known
+            if index_entry_topic(line) not in known
         ]
         archive = "\n".join(kept).strip()
         if archive:

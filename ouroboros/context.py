@@ -898,6 +898,12 @@ def build_knowledge_sections(
     The main-chat assembly uses that — durable knowledge is retrieved from Engram
     on demand now, but a project's own progress memory is not something the agent
     should have to go and ask for. The default preserves every other caller.
+
+    The index itself is rendered as a UNION of the two homes (see
+    ``knowledge_index_union_body``): the archive's entries keep their summaries and the
+    store index contributes one line for every topic the archive froze before, so a lane
+    that renders this section can finally NAME a topic written since the local write was
+    retired. Only the union's growing half is bounded — and its omission is named.
     """
     sections: List[str] = []
     # Knowledge base index: for a project-scoped task load ONLY the current
@@ -912,11 +918,20 @@ def build_knowledge_sections(
             knowledge_index = (project_knowledge_dir(pid) / "index-full.md", f"## Project knowledge ({pid})", "project knowledge index")
         else:
             knowledge_index = (env.drive_path("memory/knowledge/index-full.md"), "## Knowledge base", "knowledge index")
-        for path, header, label in (
-            knowledge_index,
-            (env.drive_path("memory/knowledge/patterns.md"), pattern_header, "patterns register"),
+        for path, header, label, union in (
+            (*knowledge_index, True),
+            (env.drive_path("memory/knowledge/patterns.md"), pattern_header, "patterns register", False),
         ):
             text = safe_read(path)
+            if union:
+                from ouroboros.tools.knowledge import knowledge_index_union_body
+
+                text = knowledge_index_union_body(
+                    path,
+                    text,
+                    budget=KNOWLEDGE_INDEX_BUDGET_CHARS,
+                    drive_root=getattr(env, "drive_root", None),
+                )
             if not text.strip():
                 continue
             if warn_large and len(text) > _LARGE_CONTEXT_SECTION_CHARS:

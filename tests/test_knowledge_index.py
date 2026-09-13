@@ -63,6 +63,31 @@ def _seed_history(ctx, rows: str) -> None:
     (_kdir(ctx).parent / "knowledge_history.jsonl").write_text(rows, encoding="utf-8")
 
 
+def _archive(ctx, entries: dict) -> None:
+    """Write the pre-switch archive index (its entries carry per-topic summaries)."""
+    _kdir(ctx).mkdir(parents=True, exist_ok=True)
+    (_kdir(ctx) / "index-full.md").write_text(
+        "# Knowledge Base Index\n\n"
+        + "".join(f"- **{topic}**: {summary}\n" for topic, summary in entries.items()),
+        encoding="utf-8",
+    )
+
+
+def _seed_ledger(ctx, count: int) -> None:
+    """Rows in the STORE ledger itself (the file the union's pointer must name)."""
+    from ouroboros.tools.knowledge import _index_ledger_path, _index_write_rows
+
+    assert _index_write_rows(_index_ledger_path(ctx), [
+        {
+            "ts": f"2026-09-12T00:00:{index % 60:02d}+00:00",
+            "topic": f"store-topic-{index:03d}",
+            "identity": f"knowledge:store-topic-{index:03d}",
+            "scope": "", "mode": "overwrite", "status": "sent",
+        }
+        for index in range(count)
+    ])
+
+
 # --------------------------------------------------------------------------- #
 # The seed
 # --------------------------------------------------------------------------- #
@@ -250,6 +275,87 @@ def test_the_projection_is_in_the_main_chat_and_not_in_the_background_lane():
     assert "include_derived_knowledge" not in bg_call, (
         "BG takes the default True, which is what keeps its archive index resident"
     )
+
+
+# --------------------------------------------------------------------------- #
+# The background lane's union — archive entries + store titles
+# --------------------------------------------------------------------------- #
+
+
+def test_the_bg_lane_names_a_topic_the_archive_froze_before(tmp_path):
+    """The acceptance case: the lane that renders the archive can NAME a topic
+    written after the local write was retired — without losing the summaries."""
+    from ouroboros.context import build_knowledge_sections
+
+    ctx = _Ctx(tmp_path / "drive")
+    _archive(ctx, {"pre-switch-topic": "the archived summary"})
+    _seed_history(ctx, _history_row("post-switch-topic", "2026-09-12T00:00:00+00:00"))
+
+    blob = "\n".join(build_knowledge_sections(_env(ctx)))
+
+    assert "the archived summary" in blob, "an archive entry keeps its summary"
+    assert "knowledge:post-switch-topic" in blob, "a post-switch topic is NAMED"
+    assert "- pre-switch-topic —" not in blob, "an archive topic is not repeated as a title"
+
+
+def test_a_topic_in_both_is_listed_once_with_its_summary(tmp_path):
+    """Deduped by topic: the archive's line wins because it carries the summary."""
+    from ouroboros.context import build_knowledge_sections
+
+    ctx = _Ctx(tmp_path / "drive")
+    _archive(ctx, {"shared-topic": "the archived summary"})
+    _seed_history(ctx, _history_row("shared-topic", "2026-09-12T00:00:00+00:00"))
+
+    blob = "\n".join(build_knowledge_sections(_env(ctx)))
+
+    assert blob.count("shared-topic") == 1, "one line per topic"
+    assert "the archived summary" in blob, "and it is the one that keeps the summary"
+    assert "knowledge:shared-topic" not in blob, "the titles-only row is suppressed"
+
+
+def test_the_bg_union_names_store_topics_with_no_archive_at_all(tmp_path):
+    """A project (or a drive that never had an archive) must not go blank: the old
+    builder skipped the section whenever the archive read was empty."""
+    from ouroboros.context import build_knowledge_sections
+
+    ctx = _Ctx(tmp_path / "drive")
+    _seed_history(ctx, _history_row("store-only-topic", "2026-09-12T00:00:00+00:00"))
+
+    blob = "\n".join(build_knowledge_sections(_env(ctx)))
+
+    assert "knowledge:store-only-topic" in blob
+
+
+def test_the_bg_union_bounds_the_store_half_and_names_the_omission(tmp_path):
+    from ouroboros.context import KNOWLEDGE_INDEX_BUDGET_CHARS, build_knowledge_sections
+
+    ctx = _Ctx(tmp_path / "drive")
+    _archive(ctx, {"pre-switch-topic": "the archived summary"})
+    _seed_ledger(ctx, 200)
+
+    blob = "\n".join(build_knowledge_sections(_env(ctx)))
+
+    assert "the archived summary" in blob, "the frozen archive half is never clipped"
+    assert "not listed here" in blob, "the omission must be NAMED (P1)"
+    assert "knowledge_index.jsonl" in blob, "and the full store index pointed at"
+    store_half = blob[blob.index("### Store topics"):]
+    assert len(store_half) <= KNOWLEDGE_INDEX_BUDGET_CHARS, len(store_half)
+
+
+def test_the_main_chat_projection_still_carries_store_titles_only(tmp_path):
+    """(d): the union is the BACKGROUND lane's shape. The resident main-chat projection
+    is untouched — it names store topics and never re-hosts the archive."""
+    from ouroboros.context import _knowledge_index_section
+
+    ctx = _Ctx(tmp_path / "drive")
+    _archive(ctx, {"archived-topic": "an archive-only summary"})
+    _seed_history(ctx, _history_row("store-topic", "2026-09-12T00:00:00+00:00"))
+
+    section = _knowledge_index_section(_env(ctx))
+
+    assert "store-topic" in section
+    assert "archived-topic" not in section
+    assert "an archive-only summary" not in section
 
 
 # --------------------------------------------------------------------------- #
