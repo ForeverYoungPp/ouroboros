@@ -23,6 +23,8 @@ from __future__ import annotations
 import json
 
 from ouroboros.context import (
+    _RECALL_MATCHED_HEADING,
+    _RECALL_NEWEST_HEADING,
     DIALOGUE_RECALL_BUDGET_CHARS,
     _engram_recall_section,
     build_memory_sections,
@@ -125,6 +127,26 @@ def test_an_unmatched_query_falls_back_to_the_newest(engram_stub):
 
     assert "## Remembered History (Engram)" in section
     assert section.strip(), "the section went blank when the query matched nothing"
+    # ...and it must SAY it is recency. The section renders under "Relevant recalled
+    # memory", so an unlabelled fallback tells the reader these were matches.
+    assert _RECALL_NEWEST_HEADING.strip() in section
+    assert _RECALL_MATCHED_HEADING.strip() not in section
+    reset_sinks()
+
+
+def test_a_matched_query_labels_each_half_exactly_once(engram_stub):
+    """Both halves carry their own heading, and neither heading is doubled."""
+    state, env = engram_stub
+    _seed(state, [
+        _block("2026-09-05", "older span"),
+        _block("2026-09-09", "newest span"),
+    ])
+    memory = Memory(env.drive_root, env.repo_dir)
+
+    section = _engram_recall_section(memory, "newest span")  # multi-word -> both halves
+
+    assert section.count(_RECALL_NEWEST_HEADING.strip()) == 1
+    assert section.count(_RECALL_MATCHED_HEADING.strip()) == 1
     reset_sinks()
 
 

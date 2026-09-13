@@ -1117,15 +1117,31 @@ def _engram_recall_section(memory: Memory, query: str = "") -> str:
     try:
         client = client_for(memory)
 
-        def _newest(max_chars: int) -> Any:
+        def _newest(max_chars: int, *, label: bool = True) -> Any:
             # Small window on purpose: the recency read carries full bodies, so a
             # 50-record pull to render 5 titles is pure over-fetch.
-            return digest(
+            read = digest(
                 client,
                 limit=MAX_RECALL_ITEMS,
                 max_chars=max_chars,
                 window=MAX_RECALL_ITEMS,
             )
+            # RECENCY IS NOT A MATCH, and this text renders under "Relevant recalled
+            # memory": unlabelled, a fallback reads as "these are the memories about your
+            # question" — the reader cannot tell an empty hit set from a weak one, which
+            # is the difference between "I know nothing about this" and "here is what
+            # happened lately". Same heading the multi-word path uses for its continuity
+            # half; that path passes ``label=False`` because it places the heading itself.
+            if label and read.status == "ok" and str(read.text or "").strip():
+                return MachineRead(
+                    read.ok,
+                    status=read.status,
+                    count=read.count,
+                    version=read.version,
+                    text=_RECALL_NEWEST_HEADING + read.text,
+                    detail=read.detail,
+                )
+            return read
 
         def _fetch() -> Any:
             text = str(query or "").strip()
@@ -1194,7 +1210,7 @@ def _engram_recall_section(memory: Memory, query: str = "") -> str:
                 titles = str(knowledge.text or "").strip()
                 if titles:
                     extra = "\n\n" + _RECALL_KNOWLEDGE_HEADING + titles
-            newest = _newest(_RECALL_HALF_BUDGET_CHARS)
+            newest = _newest(_RECALL_HALF_BUDGET_CHARS, label=False)
             if not (newest.readable and newest.status == "ok" and str(newest.text or "").strip()):
                 return MachineRead(
                     True,
