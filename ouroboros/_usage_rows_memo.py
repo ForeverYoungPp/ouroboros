@@ -215,10 +215,20 @@ def _read_records_locked_cached(root: pathlib.Path) -> list:
             merged = rows if not new_rows else [*rows, *new_rows]
             _ledger_cache_put(key, (new_resume, merged))
             return list(merged)
-    records = ua._read_records_locked(root)
+    # COLD: no in-process fingerprint, so the durable one decides — this process
+    # validates only the bytes appended since the watermark instead of replaying the
+    # whole file. ``None`` (absent/stale/mismatched/corrupt) is the full replay, which
+    # owns quarantine and raises on real corruption.
+    records = ua._read_records_resumed_locked(root)
+    if records is None:
+        records = ua._read_records_locked(root)
     try:
         resume = ua._ledger_resume_state(root, records)
         _ledger_cache_put(key, (resume, list(records)))
+        # Advance-only-after-validate: the read above either validated the whole file
+        # or validated the tail against the watermark's states. A read that failed
+        # raised from here to the caller, so this line is never reached by one.
+        ua._watermark_advance_locked(root, resume)
     except Exception:  # noqa: BLE001 — caching is best-effort; correctness is the full read
         log.debug("ledger read-cache seed failed for %s", key, exc_info=True)
         with _LEDGER_READ_CACHE_LOCK:

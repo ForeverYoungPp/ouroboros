@@ -450,3 +450,140 @@ def test_ledger_read_cache_falls_back_when_the_file_is_rewritten(data_root):
         raw = ua._read_records_locked(data_root)
     assert after == raw
     assert len(after) == 2  # the cached four-row state was not served
+
+
+# --------------------------------------------------------------------------- #
+# The durable cold-path watermark (#129 follow-up): a process with NO in-process
+# fingerprint validates only the bytes appended since, and returns the same rows.
+# --------------------------------------------------------------------------- #
+
+
+def _validated_rows(monkeypatch) -> list:
+    """Every ``_validate_records`` call as ``(start_seq, rows_validated)``."""
+    from ouroboros import usage_ledger
+
+    calls: list = []
+    real = usage_ledger._validate_records
+
+    def counting(records, *, start_seq=1, states=None):
+        calls.append((int(start_seq), len(records)))
+        return real(records, start_seq=start_seq, states=states)
+
+    monkeypatch.setattr(usage_ledger, "_validate_records", counting)
+    return calls
+
+
+def _watermark(data_root) -> dict:
+    return json.loads((data_root / ua.WATERMARK_REL).read_text(encoding="utf-8"))
+
+
+def test_a_cold_read_resumes_from_the_watermark_and_matches_the_full_read(data_root, monkeypatch):
+    """(a) Cold with a valid watermark: only the appended bytes are validated, and
+    the rows are exactly the ones a full validated replay returns."""
+    _clear_ledger_read_cache()
+    ua.release_attempt(ua.reserve_attempt(_request(data_root)))  # seeds the watermark
+    assert (data_root / ua.WATERMARK_REL).is_file()
+    ua.mark_dispatched(ua.reserve_attempt(_request(data_root, task_id="next")))
+
+    calls = _validated_rows(monkeypatch)
+    _clear_ledger_read_cache()
+    with ua._locked(data_root):
+        cold = ua._read_records_locked_cached(data_root)
+    resumed = list(calls)
+    calls.clear()
+    with ua._locked(data_root):
+        raw = ua._read_records_locked(data_root)
+
+    assert cold == raw, "the resumed read must be the full read's row list"
+    assert resumed, "the resumed read validated the appended rows"
+    assert all(rows < len(raw) for _, rows in resumed), (
+        "the prefix must not be re-validated — that is the whole cold-path bound"
+    )
+    assert calls == [(1, len(raw))], "and the full replay still validates everything"
+
+
+def test_a_cold_read_sees_rows_appended_after_the_watermark(data_root):
+    """(c) The watermark is a position, not a snapshot: an append made while no
+    cache was warm must be visible to the next cold read."""
+    _clear_ledger_read_cache()
+    ua.release_attempt(ua.reserve_attempt(_request(data_root)))
+    ua.release_attempt(ua.reserve_attempt(_request(data_root, task_id="later")))
+
+    _clear_ledger_read_cache()
+    with ua._locked(data_root):
+        cold = ua._read_records_locked_cached(data_root)
+        raw = ua._read_records_locked(data_root)
+
+    assert cold == raw
+    assert len(cold) == 4, "both attempts' rows are there, not just the pre-watermark ones"
+
+
+@pytest.mark.parametrize("damage", ["absent", "malformed", "foreign_file", "shortened", "rewritten_prefix"])
+def test_a_watermark_that_cannot_be_trusted_falls_back_to_the_full_read(
+    data_root, monkeypatch, damage,
+):
+    """(b) Any doubt about the watermark is a full replay, never a partial answer."""
+    _clear_ledger_read_cache()
+    ua.release_attempt(ua.reserve_attempt(_request(data_root)))
+    mark = _watermark(data_root)
+    path = data_root / ua.WATERMARK_REL
+
+    if damage == "absent":
+        path.unlink()
+    elif damage == "malformed":
+        path.write_text("{not json", encoding="utf-8")
+    elif damage == "foreign_file":
+        path.write_text(json.dumps({**mark, "st_ino": mark["st_ino"] + 1}), encoding="utf-8")
+    elif damage == "shortened":
+        path.write_text(json.dumps({**mark, "size": mark["size"] + 4096}), encoding="utf-8")
+    else:
+        # A prefix that no longer yields the row count the watermark recorded.
+        path.write_text(json.dumps({**mark, "row_count": mark["row_count"] + 1}), encoding="utf-8")
+
+    calls = []
+    real = ua._read_records_locked
+
+    def counting(root):
+        calls.append(root)
+        return real(root)
+
+    monkeypatch.setattr(ua, "_read_records_locked", counting)
+    _clear_ledger_read_cache()
+    with ua._locked(data_root):
+        cold = ua._read_records_locked_cached(data_root)
+        raw = real(data_root)
+
+    assert cold == raw
+    assert calls, f"a {damage} watermark must route the cold read through the full replay"
+
+
+def test_the_watermark_never_advances_when_the_validate_fails(data_root):
+    """(d) Advance-only-after-validate: a read that could not validate the ledger
+    raises, and the watermark is left exactly where the last good read put it."""
+    _clear_ledger_read_cache()
+    ua.release_attempt(ua.reserve_attempt(_request(data_root)))
+    before = (data_root / ua.WATERMARK_REL).read_bytes()
+
+    ledger = data_root / ua.LEDGER_REL
+    lines = ledger.read_bytes().splitlines(keepends=True)
+    lines[0] = b'{"seq":\n'  # corrupt a MIDDLE row: the full reader must refuse it
+    ledger.write_bytes(b"".join(lines))
+
+    _clear_ledger_read_cache()
+    with pytest.raises(ua.UsageLedgerCorrupt):
+        with ua._locked(data_root):
+            ua._read_records_locked_cached(data_root)
+
+    assert (data_root / ua.WATERMARK_REL).read_bytes() == before, (
+        "a failed validate must not move the watermark"
+    )
+
+
+def test_the_watermark_does_not_exist_before_any_ledger_does(data_root):
+    """No ledger, no watermark file: a read of an empty drive creates no state
+    (the entry the consciousness cycle's no-local-watermark test guards)."""
+    _clear_ledger_read_cache()
+    with ua._locked(data_root):
+        assert ua._read_records_locked_cached(data_root) == []
+
+    assert not (data_root / ua.WATERMARK_REL).exists()

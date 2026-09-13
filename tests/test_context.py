@@ -464,7 +464,10 @@ class TestHotStoreGrowthInvariant:
         assert "monetary lock" in result
         assert "COLD path" in result
         assert "_LEDGER_READ_CACHE_MAX_ROOTS" in result
-        assert "neither implemented" in result
+        # The cold-path bound is IMPLEMENTED now, and the note says which one: the
+        # durable watermark resumes validation from the last validated read.
+        assert "WATERMARK_REL" in result
+        assert "only the bytes appended since" in result
         assert "No compaction, rotation or trimming primitive exists" in result
         # ...and no SIZE figure of its own: the line already prints the live size, and an
         # unsupported per-row constant is the same class of claim we just removed.

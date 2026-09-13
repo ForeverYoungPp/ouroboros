@@ -737,12 +737,14 @@ def _hot_store_thresholds() -> Tuple[Tuple[str, int, str], ...]:
             USAGE_LEDGER_WARN_BYTES,
             "Append-only and unbounded. The per-process "
             "read cache (usage_ledger._LedgerRowsMemo) makes the steady-state in-lock "
-            "read incremental, but the COLD path — a restart, cache-slot eviction "
-            "(_LEDGER_READ_CACHE_MAX_ROOTS = 8), or any read failure — still parses and "
-            "validates the WHOLE file under the 45s monetary lock, and this install "
-            "restarts often. No compaction, rotation or trimming primitive exists in the "
-            "usage surfaces; a cold-path bound or generational rebasing are candidate "
-            "remediations, neither implemented.",
+            "read incremental, and the durable watermark (usage_ledger.WATERMARK_REL) "
+            "bounds the COLD path — a restart, cache-slot eviction "
+            "(_LEDGER_READ_CACHE_MAX_ROOTS = 8), or any read failure — to validating only "
+            "the bytes appended since the last validated read, under the same 45s monetary "
+            "lock. It does not shrink the file (the rows are still parsed, and the ledger "
+            "stays the only spend authority). No compaction, rotation or trimming "
+            "primitive exists in the usage surfaces; generational rebasing — the only "
+            "option that bounds the file — is a candidate remediation, not implemented.",
         ),
         ("logs/events.jsonl", EVENTS_LOG_WARN_BYTES, no_rotation),
         ("logs/tools.jsonl", TOOLS_LOG_WARN_BYTES, no_rotation),

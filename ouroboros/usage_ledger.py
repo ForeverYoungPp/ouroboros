@@ -25,16 +25,22 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, Optional, Sequence, Tuple
 
-from ouroboros.utils import append_jsonl, replace_atomic, utc_now_iso
+from ouroboros.utils import append_jsonl, atomic_write_json, replace_atomic, utc_now_iso
 
 log = logging.getLogger(__name__)
 
 LEDGER_REL = pathlib.Path("state/usage_attempts.jsonl")
 QUARANTINE_REL = pathlib.Path("state/usage_attempts.quarantine.jsonl")
+#: The durable COLD-PATH watermark (razzant/ouroboros#129 follow-up, v6.114.36): the
+#: ledger position a process last VALIDATED, beside the ledger in ``state/`` and written
+#: under the same flock its writers hold. It exists only to make a read cheaper — see
+#: ``_read_records_resumed_locked`` — never to decide anything: the ledger stays the sole
+#: spend authority, and this file must never become an input to one.
+WATERMARK_REL = pathlib.Path("state/usage_attempts.watermark.json")
 _TERMINAL = frozenset({"settled", "unresolved", "released"})
 
 __all__ = (
-    "LEDGER_REL", "QUARANTINE_REL", "UsageAccountingError", "UsageLedgerCorrupt",
+    "LEDGER_REL", "QUARANTINE_REL", "WATERMARK_REL", "UsageAccountingError", "UsageLedgerCorrupt",
 )
 
 
@@ -473,6 +479,131 @@ def _read_new_records_locked(
         resume.row_count + len(records),
         seeded_states,
     )
+
+
+def _watermark_path(root: pathlib.Path) -> pathlib.Path:
+    return root / WATERMARK_REL
+
+
+def _watermark_read(root: pathlib.Path) -> Optional[LedgerResumeState]:
+    """The ledger position a previous read VALIDATED, or ``None`` on any doubt.
+
+    Never raises: an absent, truncated, malformed or out-of-range watermark means
+    "no watermark", and the caller pays the full replay. The value is a read
+    accelerator and nothing else, so the only failure mode of a wrong watermark is a
+    wasted stat — ``_read_records_resumed_locked`` re-stats the ledger and refuses to
+    resume on any mismatch, and ``_read_records_locked`` stays the authority.
+    """
+    try:
+        raw = json.loads(_watermark_path(root).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, TypeError):
+        log.debug("usage ledger watermark unreadable", exc_info=True)
+        return None
+    if not isinstance(raw, dict):
+        return None
+    try:
+        st_ino = int(raw["st_ino"])
+        st_dev = int(raw["st_dev"])
+        size = int(raw["size"])
+        st_mtime_ns = int(raw["st_mtime_ns"])
+        row_count = int(raw["row_count"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    states = raw.get("states")
+    if not isinstance(states, dict):
+        return None
+    if st_ino < 0 or size < 0 or row_count < 0:
+        # <0 is the sentinel family: -1 = no ledger yet, -2 = a tail that is not
+        # row-aligned, i.e. deliberately NON-RESUMABLE (see LedgerResumeState).
+        return None
+    return LedgerResumeState(
+        st_ino,
+        st_dev,
+        size,
+        st_mtime_ns,
+        row_count,
+        {str(key): str(value) for key, value in states.items()},
+    )
+
+
+def _watermark_advance_locked(root: pathlib.Path, resume: LedgerResumeState) -> None:
+    """Record ``resume`` as the validated-through position (advance-only-after-validate).
+
+    Call it AFTER a read that validated, under the same held ledger lock as that read,
+    never as part of deciding one — which is what makes "a failed validate never moves
+    the watermark" structural rather than remembered. Best-effort: a watermark is an
+    accelerator, so a write failure must cost the spend authority nothing. A missing
+    ledger and the non-resumable fingerprint write nothing at all.
+    """
+    if resume.st_ino < 0 or resume.size < 0:
+        return
+    try:
+        atomic_write_json(
+            _watermark_path(root),
+            {
+                "st_ino": resume.st_ino,
+                "st_dev": resume.st_dev,
+                "size": resume.size,
+                "st_mtime_ns": resume.st_mtime_ns,
+                "row_count": resume.row_count,
+                "states": resume.states,
+            },
+            trailing_newline=True,
+            fsync=True,
+        )
+    except Exception:
+        log.debug("usage ledger watermark write failed", exc_info=True)
+
+
+def _read_records_resumed_locked(root: pathlib.Path) -> Optional[list[Dict[str, Any]]]:
+    """The ledger's records, resumed from the durable watermark; ``None`` = replay.
+
+    A cold process (a restart, a cache-slot eviction, any read failure) has no
+    in-process fingerprint, so it re-parsed AND re-validated the whole append-only file
+    under the 45s monetary lock — the cost that grows with a file nothing bounds. The
+    watermark is that fingerprint made durable: "validated through byte N, M rows, these
+    per-attempt states". So the cold read validates ONLY the bytes appended since
+    (``_read_new_records_locked``, the very tail validator the warm path uses) and parses
+    the prefix for its rows without re-validating them — those exact bytes were validated
+    by the read that recorded the watermark, over the same inode/device/size/mtime.
+
+    ``None`` — never a partial answer — whenever the watermark cannot be trusted: absent
+    or malformed, a different file (inode/device), a file shortened below N, a prefix
+    that no longer yields exactly M rows, a rewritten or torn tail, or any parse failure.
+    The caller then replays through ``_read_records_locked``, which owns quarantine.
+    Must be called under the held ledger lock, like every other reader here.
+    """
+    resume = _watermark_read(root)
+    if resume is None:
+        return None
+    advanced = _read_new_records_locked(root, resume)
+    if advanced is None:
+        return None
+    path = root / LEDGER_REL
+    try:
+        with open(path, "rb") as handle:
+            prefix = handle.read(resume.size)
+    except OSError:
+        return None
+    records: list[Dict[str, Any]] = []
+    for chunk in prefix.splitlines(keepends=True):
+        raw = chunk.rstrip(b"\r\n")
+        if not raw:
+            continue
+        try:
+            row = json.loads(raw.decode("utf-8"))
+            if not isinstance(row, dict):
+                raise ValueError("row is not an object")
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            return None
+        records.append(row)
+    if len(records) != resume.row_count:
+        # The prefix must hold exactly the rows the watermark counted. Anything else
+        # means the watermark describes a different file than the one on disk.
+        return None
+    return [*records, *advanced[0]]
 
 
 def _append_rows_locked(

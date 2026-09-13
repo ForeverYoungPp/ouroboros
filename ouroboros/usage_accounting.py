@@ -29,6 +29,7 @@ from ouroboros.transport_custody import release_pre_dispatch_attempt
 from ouroboros.usage_ledger import (  # noqa: F401 — re-exported substrate
     LEDGER_REL,
     QUARANTINE_REL,
+    WATERMARK_REL,
     LedgerResumeState,
     UsageAccountingError,
     UsageLedgerCorrupt,
@@ -42,8 +43,10 @@ from ouroboros.usage_ledger import (  # noqa: F401 — re-exported substrate
     _number,
     _read_new_records_locked,
     _read_records_locked,
+    _read_records_resumed_locked,
     _TERMINAL,
     _validate_records,
+    _watermark_advance_locked,
     _write_bytes_atomic_fsync,
 )
 from ouroboros.utils import append_jsonl, atomic_write_json, utc_now_iso

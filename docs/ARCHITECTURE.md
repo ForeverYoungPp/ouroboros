@@ -1,4 +1,4 @@
-# Ouroboros v6.114.38 — Architecture & Reference
+# Ouroboros v6.114.39 — Architecture & Reference
 
 This file is NOT a changelog. Version history lives in README.md, git tags, and commit log.
 
@@ -600,6 +600,7 @@ A pre-existing cross-platform residual remains: shutdown admission is not atomic
 │   │   ├── betterleaks/ ← Exact versioned Betterleaks runtime and verified archive cache created only by the explicit source-checkout installer; packaged binaries live in immutable application resources
 │   │   ├── usage_attempts.jsonl ← Append-only monetary authority; every physical provider send has its own attempt id and state transition. A settled attempt with `cost=None` and a numeric reservation upper bound is counted at that bound as unresolved (protecting real spend of an unknown-price success from under-count); a zero-usage HTTP-200 body-error (429/5xx passed through the body) is instead settled at a confirmed $0 so its bound is released, not accumulated into phantom budget exhaustion under a provider storm (v6.65.4)
 │   │   ├── usage_attempts.quarantine.jsonl ← Loud quarantine evidence for a proven corrupt final ledger row; the validated prefix remains readable
+│   │   ├── usage_attempts.watermark.json ← Durable COLD-PATH watermark for the usage ledger: the position (inode/device/byte offset/row count plus per-attempt states) a read last VALIDATED, so a cold read — a restart, cache-slot eviction, or a read failure — validates only the bytes appended since instead of replaying the whole file. Written under the ledger's own flock and only after a successful validate (never on a failed one); any mismatch, truncation or corruption falls back to the full re-read, which owns quarantine. A read accelerator only: `usage_attempts.jsonl` remains the sole monetary authority
 │   │   ├── usage_import_watermark.json ← Resumable/idempotent legacy-import watermark plus source hashes and archive reference
 │   │   ├── request_wire_compatibility.json ← Cross-process locked, schema-versioned, 14-day exact-route evidence for successful same-route request-shape repairs. Records contain only closed typed actions and credential-free profile digests; malformed/future state fails open without being overwritten, and task-local explicit `none` is never stored
 │   │   ├── server_port ← Active HTTP port used by the launcher/browser handoff
