@@ -482,21 +482,64 @@ def _subtask_outcome_summary(data: Dict[str, Any], receipts: list | None = None)
     return json.dumps(summary, ensure_ascii=False, indent=2, default=str)
 
 
+_ROUTING_EVENT_TYPES = frozenset(
+    {"promote_chat_to_task", "routing_manual_target", "steer_task"}
+)
+# Routing actions that are COMMITTED: the owner message has already been routed by
+# a durable receipt, so a second routing decision for it would mint a duplicate root.
+_COMMITTED_ROUTING_STATUSES = frozenset({"delivered", "scheduled"})
+
+
+def _routing_action_label(evt: Dict[str, Any]) -> str:
+    """The turn-visible routing verb for one emitted event ("" when it is not one)."""
+    event_type = str(evt.get("type") or "")
+    if event_type not in _ROUTING_EVENT_TYPES:
+        return ""
+    if event_type == "promote_chat_to_task" and bool(evt.get("routed_from_main")):
+        return "route_to_project"
+    return event_type
+
+
+def _refuse_second_routing_action(ctx: ToolContext) -> str:
+    """One owner message yields exactly ONE routing action (BIBLE P13 floor).
+
+    ``steer_task`` / ``promote_chat_to_task`` / ``route_to_project`` are COMPETING
+    decisions about the SAME owner message, and the model can emit two of them in
+    one turn. The 2026-09-12 incident: the message that said "backlog" steered the
+    running cleanup task AND promoted a second root; both committed, and because the
+    annotation store keeps only the LATEST row per message id the promote silently
+    superseded the steer's receipt -- nothing in the host refused the second
+    decision. This is that floor: once a routing action for this message has durably
+    COMMITTED, a further one is refused before it can touch the task lane, and the
+    model is told what already happened.
+
+    Deliberately narrow. Only a COMMITTED action arms it (``delivered`` /
+    ``scheduled``), so a steer that failed its target, an unconfirmed delivery and a
+    ``needs_manual_target`` refusal all leave the message free to take another
+    decision -- including the documented "target not steerable, promote instead"
+    recovery. The fact is turn-local, so a later turn re-decides from current state.
+    """
+    prior = str(getattr(ctx, "_committed_routing_action", "") or "").strip()
+    if not prior:
+        return ""
+    return (
+        f"\u26a0\ufe0f ROUTING_ALREADY_COMMITTED: this owner message was already routed by "
+        f"{prior}. One message yields exactly ONE routing action, so nothing was "
+        "started, steered, or re-routed by this call. Answer the owner inline, or "
+        "continue the work that already carries this message."
+    )
+
+
 def _emit_control_event(ctx: ToolContext, evt: Dict[str, Any]) -> str:
     """Emit a control event live when possible, preserving legacy fallback."""
     def _mark_typed_routing_action() -> None:
-        event_type = str(evt.get("type") or "")
-        if event_type not in {"promote_chat_to_task", "routing_manual_target", "steer_task"}:
+        action = _routing_action_label(evt)
+        if not action:
             return
         # Keep a turn-local fact on the existing ToolContext so finalization can
         # expose the typed action on task_done. The supervisor receipt remains the
         # routing authority, while any non-empty final model prose is a separate
         # conversational answer and must stay durable across every transport.
-        action = (
-            "route_to_project"
-            if event_type == "promote_chat_to_task" and bool(evt.get("routed_from_main"))
-            else event_type
-        )
         setattr(ctx, "_typed_routing_action_emitted", action)
 
     try:
@@ -625,37 +668,48 @@ def _emit_and_wait_for_routing(
 ) -> tuple[str, Dict[str, Any]]:
     """Emit one routing event and return only its durable handler outcome."""
     mode = _emit_control_event(ctx, evt)
+
+    def _settle(rec: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+        # Turn-local committed fact: only a durable COMMIT arms the
+        # one-routing-action floor (`_refuse_second_routing_action`). A refusal or
+        # an unconfirmed delivery leaves the message free to re-decide.
+        if str(rec.get("status") or "") in _COMMITTED_ROUTING_STATUSES:
+            label = _routing_action_label(evt)
+            if label:
+                setattr(ctx, "_committed_routing_action", label)
+        return mode, rec
+
     if mode == "serialization_failed":
-        return mode, {
+        return _settle({
             "status": "rejected",
             "reason": "event_serialization_failed",
             "detail": "The routing event was not emitted.",
-        }
+        })
     timeout = _PROMOTE_CONFIRM_TIMEOUT_SEC if mode == "live" else 0.0
     if str(evt.get("type") or "") == "promote_chat_to_task":
         try:
-            return mode, _wait_for_promotion_admission(
+            return _settle(_wait_for_promotion_admission(
                 ctx,
                 str(evt.get("task_id") or ""),
                 str(evt.get("routing_token") or ""),
                 client_message_id=str(evt.get("client_message_id") or ""),
                 timeout_sec=timeout,
-            )
+            ))
         except Exception as exc:
             if not swarm_router_turn(ctx):
                 raise
             log.warning("Routing admission receipt failed after event emission", exc_info=True)
-            return mode, {
+            return _settle({
                 "status": "unconfirmed",
                 "reason": "admission_confirmation_failed",
                 "detail": type(exc).__name__,
-            }
-    return mode, _wait_for_routing_annotation(
+            })
+    return _settle(_wait_for_routing_annotation(
         ctx,
         str(evt.get("client_message_id") or ""),
         str(evt.get("routing_token") or ""),
         timeout_sec=timeout,
-    )
+    ))
 
 
 def _evolution_restart_block_reason(ctx: ToolContext) -> str:
@@ -931,6 +985,9 @@ def _promote_chat_to_task(
     cached = _cached_swarm_handoff(ctx)
     if cached:
         return cached
+    refusal = _refuse_second_routing_action(ctx)
+    if refusal:
+        return refusal
     from ouroboros.project_facts import (
         explicit_project_id_ok,
         project_id_from_display_name,
@@ -1167,6 +1224,9 @@ def _route_to_project(
     cached = _cached_swarm_handoff(ctx)
     if cached:
         return cached
+    refusal = _refuse_second_routing_action(ctx)
+    if refusal:
+        return refusal
     if swarm_router_turn(ctx) and str(getattr(ctx, "project_id", "") or "").strip():
         return (
             "⚠️ SWARM_PROJECT_SCOPE_OWNED: this Project-room Swarm must create its new "
@@ -1332,6 +1392,9 @@ def _steer_task(ctx: ToolContext, task_id: str, message: str) -> str:
         )
     if not msg.strip():
         return "⚠️ TOOL_ARG_ERROR (steer_task): message is required."
+    refusal = _refuse_second_routing_action(ctx)
+    if refusal:
+        return refusal
     try:
         current_chat_id = int(getattr(ctx, "current_chat_id", None) or 0)
     except (TypeError, ValueError):
