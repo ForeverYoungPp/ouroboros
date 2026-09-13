@@ -29,6 +29,34 @@ def test_verify_system_state_does_not_delete_crash_file():
     )
 
 
+def test_the_engram_boot_work_is_not_downstream_of_another_boot_check():
+    """F2: the durable-memory work must not be able to be muted at boot.
+
+    It used to live inside verify_system_state, after the git and budget checks,
+    under the caller's single broad handler whose once-guard is set BEFORE the
+    work. A raise in any of those checks therefore skipped the spool drain and the
+    dialogue carry-over — and kept skipping them for the whole life of the process,
+    because the guard was already set and nothing re-runs it. The property is an
+    ORDER, so pin the order.
+    """
+    from ouroboros import agent_startup_checks
+    from ouroboros.agent import OuroborosAgent
+
+    verify = inspect.getsource(agent_startup_checks.verify_system_state)
+    assert "flush_engram_spool" not in verify
+    assert "reconcile_local_dialogue_blocks" not in verify
+
+    boot_actions = inspect.getsource(agent_startup_checks.run_engram_boot_actions)
+    assert "flush_engram_spool" in boot_actions
+    assert "reconcile_local_dialogue_blocks" in boot_actions
+
+    boot = inspect.getsource(OuroborosAgent._log_worker_boot_once)
+    assert boot.index("run_engram_boot_actions") < boot.index("verify_restart")
+    assert boot.index("run_engram_boot_actions") < boot.index("verify_system_state")
+    # ...and before the git lookup, which can itself raise.
+    assert boot.index("run_engram_boot_actions") < boot.index("get_git_info")
+
+
 def test_health_invariants_detects_crash_report():
     """build_health_invariants must check for crash_report.json."""
     from ouroboros.context import build_health_invariants

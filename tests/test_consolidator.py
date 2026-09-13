@@ -187,3 +187,19 @@ def test_existing_dialogue_blocks_remain_authoritative(tmp_path):
     blocks_path.write_text("[]", encoding="utf-8")
 
     assert json.loads(blocks_path.read_text()) == []
+
+
+def test_an_era_carries_the_offset_span_of_the_blocks_it_covers():
+    """An era's own range is date-only, so two eras over the same day(s) would
+    carry the SAME range string — and the Engram mirror addresses a record by its
+    interval, so the older era would silently overwrite the newer. The offsets of
+    the covered blocks keep them distinct."""
+    from ouroboros.consolidator import _blocks_offset_range
+
+    assert _blocks_offset_range(
+        [{"offset_range": "0-100"}, {"offset_range": "100-200"}, {"offset_range": "300-400"}]
+    ) == "0-400"
+    # Blocks distilled before offsets were recorded have none: "" so the mirror
+    # falls back to their timestamps instead of inventing an interval.
+    assert _blocks_offset_range([{"range": "2026-09-05"}]) == ""
+    assert _blocks_offset_range([]) == ""

@@ -460,7 +460,48 @@ class TestHotStoreGrowthInvariant:
         result = build_health_invariants(env)
         assert "HOT STORE GROWTH" in result
         assert "state/usage_attempts.jsonl" in result
+        # The note states the real cost: the COLD path, not "every reservation".
         assert "monetary lock" in result
+        assert "COLD path" in result
+        assert "_LEDGER_READ_CACHE_MAX_ROOTS" in result
+        assert "neither implemented" in result
+        assert "No compaction, rotation or trimming primitive exists" in result
+        # ...and no SIZE figure of its own: the line already prints the live size, and an
+        # unsupported per-row constant is the same class of claim we just removed.
+        assert "per reservation row" not in result
+        assert "KB per" not in result
+
+    def test_the_growth_notes_promise_no_remediation_that_does_not_exist(self, tmp_path):
+        """Honesty pin (owner report): the ledger note named a compaction primitive that
+        exists nowhere in the usage surfaces, and both notes carried a "tracked as a
+        GitHub issue" pointer that is dead on this fork (issues are disabled). A
+        remediation we cannot perform must not be rendered as the answer."""
+        from ouroboros.context_budget import (
+            EVENTS_LOG_WARN_BYTES,
+            TOOLS_LOG_WARN_BYTES,
+            USAGE_LEDGER_WARN_BYTES,
+        )
+
+        env = _make_health_env(tmp_path)
+        _grow_ledger(tmp_path / "state" / "usage_attempts.jsonl", USAGE_LEDGER_WARN_BYTES + 1)
+        _grow_file(tmp_path / "logs" / "events.jsonl", EVENTS_LOG_WARN_BYTES + 1)
+        _grow_file(tmp_path / "logs" / "tools.jsonl", TOOLS_LOG_WARN_BYTES + 1)
+
+        result = build_health_invariants(env)
+
+        assert result.count("HOT STORE GROWTH") >= 3, "all three stores are over threshold"
+        for banned in (
+            "tracked as a GitHub issue",
+            "ledger compaction is the remediation",
+            "compaction is the remediation",
+            # A figure without its basis is the same class, one notch finer: the line
+            # already prints the measured size at render time.
+            "per reservation row",
+            "KB per",
+        ):
+            assert banned not in result, f"{banned!r} must not be rendered"
+        # What IS rendered: the candidate remediations, named as unimplemented.
+        assert "candidate remediation" in result
 
     def test_events_and_tools_thresholds_are_generous_but_live(self, tmp_path):
         from ouroboros.context_budget import EVENTS_LOG_WARN_BYTES, TOOLS_LOG_WARN_BYTES
@@ -1207,11 +1248,66 @@ def test_automatic_recent_context_materializes_a_bounded_row_suffix(tmp_path):
 
     assert [entry["text"] for entry in entries] == ["row-19999"]
     assert coverage["generations"][0]["rows"] <= 100
+    # Policy split: a bounded PREFIX is disclosed rather than unknown, but this
+    # fixture also omits tail rows (20,000 rows against the scan bound), and a
+    # tail-rows omission is still a real unknown.
     assert coverage["omitted_matching_rows_unknown"] is True
     assert any(
         gap["kind"] in {"generation_prefix_unscanned", "generation_tail_rows_unscanned"}
         for gap in coverage["gaps"]
     )
+
+
+def test_bounded_prefix_discloses_without_inflating_the_unknown_flag(tmp_path):
+    """The split: a prefix alone is disclosed; tail rows or a rotated generation stay unknown."""
+    from ouroboros.memory import Memory
+
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True)
+    (logs / "chat.jsonl").write_text(
+        "".join(
+            json.dumps({"direction": "in", "text": "x" * 30_000}) + "\n"
+            for _ in range(22)
+        ),
+        encoding="utf-8",
+    )
+
+    _, prefix_only = Memory(tmp_path).read_unconsolidated_chat({}, 40)
+
+    assert all(
+        gap["kind"] == "generation_prefix_unscanned" for gap in prefix_only["gaps"]
+    )
+    assert prefix_only["omitted_matching_rows_unknown"] is False
+
+    (logs / "chat.jsonl").write_text(
+        "".join(
+            json.dumps({"direction": "in", "text": "y" * 200}) + "\n"
+            for _ in range(6000)
+        ),
+        encoding="utf-8",
+    )
+
+    _, with_tail_rows = Memory(tmp_path).read_unconsolidated_chat({}, 40)
+
+    assert any(
+        gap["kind"] == "generation_tail_rows_unscanned" for gap in with_tail_rows["gaps"]
+    )
+    assert with_tail_rows["omitted_matching_rows_unknown"] is True
+
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    for index in range(4):
+        (archive / f"chat_20260821T{index:02d}0000.jsonl").write_text(
+            json.dumps({"direction": "in", "text": f"archive-{index}"}) + "\n",
+            encoding="utf-8",
+        )
+
+    _, rotated = Memory(tmp_path).read_unconsolidated_chat({}, 40)
+
+    assert any(
+        gap["kind"] == "unscanned_unconsolidated_generations" for gap in rotated["gaps"]
+    )
+    assert rotated["omitted_matching_rows_unknown"] is True
 
 
 def test_chat_history_surfaces_malformed_gap_even_when_search_matches_nothing(tmp_path):
@@ -1540,7 +1636,15 @@ def test_world_profile_is_loaded_with_stable_memory(tmp_path):
     assert "world-profile-data" in combined
 
 
-def test_retired_dialogue_summary_remains_visible_when_blocks_exist(tmp_path):
+def test_dialogue_history_is_not_injected_even_when_blocks_and_legacy_summary_exist(tmp_path):
+    """Reading side (AC9): consolidation leaves the prompt; its data does not.
+
+    This test used to assert the opposite — that `## Dialogue History` and the
+    retired flat summary were both rendered. They are deliberately not rendered
+    any more: the blocks are LLM-authored, doubly lossy, and unreclaimable by
+    runtime compaction, while duplicating the raw tail `## Recent chat` carries.
+    The layer is demoted to on-demand retrieval, so the *files must survive*.
+    """
     from ouroboros.context import build_memory_sections
     from ouroboros.memory import Memory
 
@@ -1555,25 +1659,46 @@ def test_retired_dialogue_summary_remains_visible_when_blocks_exist(tmp_path):
 
     combined = "\n\n".join(build_memory_sections(memory, partition="volatile"))
 
-    assert "## Dialogue History" in combined
-    assert "new dialogue block" in combined
-    assert "## Legacy Dialogue Summary (retired flat format, read-only fallback)" in combined
-    assert "legacy dialogue" in combined
+    assert "## Dialogue History" not in combined
+    assert "new dialogue block" not in combined
+    assert "## Legacy Dialogue Summary" not in combined
+    assert "legacy dialogue" not in combined
+    # Demoted, not deleted: both artefacts are still on disk for on-demand reads.
+    assert (memory_dir / "dialogue_blocks.json").exists()
+    assert (memory_dir / "dialogue_summary.md").exists()
 
 
-def test_retired_dialogue_summary_fallback_preserves_continuity_without_blocks(tmp_path):
+def test_volatile_partition_carries_scratchpad_and_still_projects_durable_gaps(tmp_path):
+    """The continuity signal that survives the section: durable gaps.
+
+    Continuity used to be asserted through the rendered legacy summary. That
+    rendering is gone, so the surviving guarantee is that a known history
+    discontinuity is still *reported* to its consumers rather than silently
+    dropped (BIBLE P1).
+    """
     from ouroboros.context import build_memory_sections
     from ouroboros.memory import Memory
 
     memory_dir = tmp_path / "memory"
     memory_dir.mkdir(parents=True, exist_ok=True)
+    (memory_dir / "scratchpad.md").write_text("working memory", encoding="utf-8")
     (memory_dir / "dialogue_summary.md").write_text("legacy dialogue only", encoding="utf-8")
+    (memory_dir / "dialogue_blocks.json").write_text(
+        json.dumps([{"gap_id": "g1", "content": "[MEMORY GAP] a span is unknowable"}]),
+        encoding="utf-8",
+    )
     memory = Memory(drive_root=tmp_path)
 
-    combined = "\n\n".join(build_memory_sections(memory, partition="volatile"))
+    gaps: list = []
+    combined = "\n\n".join(
+        build_memory_sections(memory, partition="volatile", durable_dialogue_gaps_out=gaps)
+    )
 
-    assert "## Legacy Dialogue Summary (retired flat format, read-only fallback)" in combined
-    assert "legacy dialogue only" in combined
+    assert "## Scratchpad" in combined
+    assert "working memory" in combined
+    assert "## Dialogue History" not in combined
+    assert "## Legacy Dialogue Summary" not in combined
+    assert any(g.get("gap_id") == "g1" for g in gaps)
 
 
 def test_recent_sections_filter_process_logs_by_task_id(tmp_path):
@@ -2078,3 +2203,51 @@ def test_delegation_fact_failure_never_drops_capability_digest(tmp_path, monkeyp
     # The surrounding digest survives intact.
     assert "allow_mutative_subagents" in capabilities
     assert "write_surfaces" in capabilities
+
+
+def test_the_prompt_tells_the_model_to_retrieve_before_planning(tmp_path):
+    """D — prompt-only: the planning seam names the retrieval tools, no gates."""
+    from ouroboros.context import build_llm_messages
+    from ouroboros.memory import Memory
+
+    class FakeEnv:
+        @property
+        def repo_dir(self):
+            return tmp_path / "repo"
+
+        @property
+        def drive_root(self):
+            return tmp_path
+
+        def drive_path(self, p):
+            return tmp_path / p
+
+        def repo_path(self, p):
+            return tmp_path / "repo" / p
+
+    (tmp_path / "repo" / "prompts").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "repo" / "docs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "memory" / "knowledge").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "repo" / "prompts" / "SYSTEM.md").write_text("System prompt", encoding="utf-8")
+    (tmp_path / "repo" / "BIBLE.md").write_text("Bible", encoding="utf-8")
+    (tmp_path / "repo" / "README.md").write_text("README", encoding="utf-8")
+    (tmp_path / "repo" / "docs" / "ARCHITECTURE.md").write_text("# Ouroboros v1.2.3", encoding="utf-8")
+    (tmp_path / "repo" / "docs" / "DEVELOPMENT.md").write_text("# Dev", encoding="utf-8")
+    (tmp_path / "repo" / "docs" / "CHECKLISTS.md").write_text("Checklist", encoding="utf-8")
+    (tmp_path / "repo" / "VERSION").write_text("1.2.3", encoding="utf-8")
+    (tmp_path / "repo" / "pyproject.toml").write_text('version = "1.2.3"', encoding="utf-8")
+    (tmp_path / "state" / "state.json").write_text('{"spent_usd": 0}', encoding="utf-8")
+    (tmp_path / "memory" / "identity.md").write_text("I am Ouroboros", encoding="utf-8")
+    (tmp_path / "memory" / "scratchpad.md").write_text("scratchpad", encoding="utf-8")
+
+    messages, _ = build_llm_messages(
+        env=FakeEnv(), memory=Memory(drive_root=tmp_path),
+        task={"id": "t", "type": "task", "text": "hello"},
+    )
+    dynamic_text = messages[0]["content"][2]["text"]
+
+    assert "## Task Contract Discipline" in dynamic_text
+    assert "Before planning, check `knowledge_read` and the `engram` tool" in dynamic_text
+    assert "empty memory is not the default assumption" in dynamic_text

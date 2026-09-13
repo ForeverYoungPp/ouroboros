@@ -133,11 +133,24 @@ def test_knowledge_write_project_scoped_goes_to_project_store(tmp_path, monkeypa
 
 
 def test_knowledge_write_canonical_when_no_project(tmp_path):
+    """S2: the canonical store's LOCAL write is retired.
+
+    This test and the project-scoped one above protect an isolation invariant: a
+    project write lands in the project store and NEVER in the canonical tree (that
+    half is unchanged). What changed is that the canonical path no longer has a
+    local landing point at all — its record goes to Engram — so the assertion here
+    flips from "the file exists" to "the local tree is untouched", while the
+    provenance audit trail still lands on the canonical drive (BIBLE P1).
+    """
     from ouroboros.tools import knowledge
 
     ctx = _Ctx(tmp_path / "drive", project_id="")
-    knowledge._knowledge_write(ctx, "facts", "global fact", "overwrite")
-    assert (ctx.drive_root / "memory" / "knowledge" / "facts.md").exists()
+    out = knowledge._knowledge_write(ctx, "facts", "global fact", "overwrite")
+
+    assert not (ctx.drive_root / "memory" / "knowledge" / "facts.md").exists()
+    assert "Engram" in out
+    history = (ctx.drive_root / "memory" / "knowledge_history.jsonl").read_text(encoding="utf-8")
+    assert "global fact" in history
 
 
 # --- selective context load ---------------------------------------------------
@@ -298,6 +311,12 @@ def test_maybe_promote_skips_project_scoped_task(tmp_path, monkeypatch):
 
 
 def test_apply_memory_actions_canonical_when_unscoped(tmp_path):
+    """Unscoped reflection actions still land on the canonical drive.
+
+    The knowledge action's landing point is now the provenance trail rather than
+    a ``<topic>.md`` file (S2 retired the canonical local write), so the assertion
+    follows the record to where it now lives instead of dropping the guard.
+    """
     from ouroboros.reflection import apply_memory_actions
 
     drive = tmp_path / "drive"
@@ -306,4 +325,6 @@ def test_apply_memory_actions_canonical_when_unscoped(tmp_path):
         {"type": "knowledge_write", "topic": "gfacts", "content": "global knowledge"},
     ])
     assert applied == 1
-    assert (drive / "memory" / "knowledge" / "gfacts.md").exists()
+    assert not (drive / "memory" / "knowledge" / "gfacts.md").exists()
+    history = (drive / "memory" / "knowledge_history.jsonl").read_text(encoding="utf-8")
+    assert "global knowledge" in history

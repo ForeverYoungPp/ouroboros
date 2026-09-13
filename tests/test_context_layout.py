@@ -13,10 +13,26 @@ def test_tier0_protected_core_declared():
         "bible",
         "identity",
         "scratchpad",
-        "knowledge_index",
         "recent_dialogue",
     }
     assert expected <= set(cl.TIER0_ALWAYS_FULL)
+
+
+def test_knowledge_index_left_tier0_as_a_declared_demotion_not_an_omission():
+    """A section may leave the always-resident core — but only in writing.
+
+    `knowledge_index` is no longer rendered into the prompt; durable knowledge is
+    retrieved from Engram on demand instead. The danger is not the demotion, it
+    is a demotion that nobody recorded: the next change reads TIER0_ALWAYS_FULL,
+    believes knowledge is always resident, and reasons from a false premise.
+    """
+    assert "knowledge_index" not in cl.TIER0_ALWAYS_FULL
+    assert "knowledge_index" in cl.TIER0_RETRIEVAL_BACKED
+
+
+def test_tier0_sets_are_disjoint():
+    """A section is either always-resident or retrieval-backed, never both."""
+    assert not (set(cl.TIER0_ALWAYS_FULL) & set(cl.TIER0_RETRIEVAL_BACKED))
 
 
 def test_nav_map_lists_h2_through_h4_as_inclusive_complete_subtrees():

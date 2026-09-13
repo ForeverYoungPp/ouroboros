@@ -8,6 +8,7 @@ import os
 import pathlib
 import re
 import subprocess
+import threading
 import time
 from typing import Any, Dict, Tuple
 
@@ -718,8 +719,10 @@ def _hot_store_thresholds() -> Tuple[Tuple[str, int, str], ...]:
     )
 
     no_rotation = (
-        "This store has no rotation; readers that replay it degrade with size. "
-        "Rotation/archival is the remediation (tracked as a GitHub issue)."
+        "No rotation is wired for this store, so readers that replay it degrade with "
+        "size. Wiring the existing rotator "
+        "(supervisor/state.py::rotate_jsonl_log_if_needed) for it is a candidate "
+        "remediation, not implemented."
     )
     return (
         (
@@ -732,9 +735,14 @@ def _hot_store_thresholds() -> Tuple[Tuple[str, int, str], ...]:
         (
             "state/usage_attempts.jsonl",
             USAGE_LEDGER_WARN_BYTES,
-            "Every reservation re-reads the ledger under the monetary lock "
-            "(~0.5s hold at 20MB — see usage_ledger.py); ledger compaction is "
-            "the remediation (tracked as a GitHub issue).",
+            "Append-only and unbounded. The per-process "
+            "read cache (usage_ledger._LedgerRowsMemo) makes the steady-state in-lock "
+            "read incremental, but the COLD path — a restart, cache-slot eviction "
+            "(_LEDGER_READ_CACHE_MAX_ROOTS = 8), or any read failure — still parses and "
+            "validates the WHOLE file under the 45s monetary lock, and this install "
+            "restarts often. No compaction, rotation or trimming primitive exists in the "
+            "usage surfaces; a cold-path bound or generational rebasing are candidate "
+            "remediations, neither implemented.",
         ),
         ("logs/events.jsonl", EVENTS_LOG_WARN_BYTES, no_rotation),
         ("logs/tools.jsonl", TOOLS_LOG_WARN_BYTES, no_rotation),
@@ -818,6 +826,59 @@ def check_extension_health(env: Any) -> Tuple[Dict[str, Any], int]:
         log.warning("Extension regression(s) detected since last healthy version: %s", names)
         return {"status": "regressed", "skills": names}, 1
     return {"status": "ok"}, 0
+
+
+#: The Engram boot actions run at most once per process, tracked separately from
+#: ``verify_system_state`` on purpose — see ``run_engram_boot_actions``.
+_engram_boot_actions_done = False
+_engram_boot_actions_lock = threading.Lock()
+
+
+def run_engram_boot_actions(env: Any) -> Dict[str, Any]:
+    """The durable-memory work that must happen on every start. Returns what it did.
+
+    Two jobs: drain the spool a previous run could not forward (write-then-forward,
+    C17), and carry over the dialogue blocks distilled before the prompt seam moved
+    to Engram, so the distilled biography does not simply begin at the changeover.
+
+    This is deliberately its OWN function, with its own once-flag, called BEFORE
+    ``verify_system_state`` and never from inside it. It used to sit inside that
+    function, after the git and budget checks, under the caller's single broad
+    handler: a raise in any of those checks returned out of the handler and the
+    durable-memory work never ran — and never would in that process, because the
+    caller's once-guard had already been set. Nothing about a git or budget check
+    should be able to mute the memory path, so the dependency was removed rather
+    than documented.
+
+    The flag is set only AFTER the work, so a call that did not get to run is
+    retried rather than recorded as done. Every step is best-effort (C6): an
+    unreachable Engram leaves its records for the next start instead of failing a
+    boot.
+    """
+    global _engram_boot_actions_done
+    with _engram_boot_actions_lock:
+        if _engram_boot_actions_done:
+            return {}
+    done: Dict[str, Any] = {}
+    try:
+        from ouroboros.engram_sink import flush_engram_spool
+
+        forwarded = flush_engram_spool(env)
+        if forwarded:
+            done["engram_spool_forwarded"] = forwarded
+    except Exception:
+        pass
+    try:
+        from ouroboros.engram_sink import reconcile_local_dialogue_blocks
+
+        reconciled = reconcile_local_dialogue_blocks(env)
+        if reconciled:
+            done["engram_dialogue_reconciled"] = reconciled
+    except Exception:
+        pass
+    with _engram_boot_actions_lock:
+        _engram_boot_actions_done = True
+    return done
 
 
 def verify_system_state(env: Any, git_sha: str) -> None:
@@ -990,6 +1051,32 @@ def _append_cycle_outcome_tag(env: Any, *, campaign: Any, transaction: Any, sour
             source=source,
             backlog_id=backlog_id,
         )
+        # Additive remote sink (WO, second phase). This is the run where the
+        # real verdict becomes known, so it carries the same task_id as the
+        # task-done row and upserts it in Engram instead of leaving a permanent
+        # `waiting_for_restart` half-memory (C19).
+        try:
+            from ouroboros.engram_sink import emit_evolution_outcome
+
+            tx = transaction if isinstance(transaction, dict) else {}
+            camp = campaign if isinstance(campaign, dict) else {}
+            # ``env`` carries both roots; passing the bare drive path would
+            # resolve the project from ``.../data``.
+            emit_evolution_outcome(
+                env,
+                {
+                    "kind": "cycle_outcome",
+                    "task_id": str(tx.get("task_id") or ""),
+                    "campaign_id": str(camp.get("id") or tx.get("campaign_id") or ""),
+                    "campaign_objective": str(camp.get("objective") or ""),
+                    "cycle_outcome": str(tx.get("cycle_outcome") or ""),
+                    "abandoned_reason": str(tx.get("abandoned_reason") or ""),
+                    "commit_sha": str(tx.get("commit_sha") or ""),
+                    "outcome_axes": tx.get("outcome_axes") or {},
+                },
+            )
+        except Exception:
+            log.debug("Engram cycle-outcome mirror failed", exc_info=True)
     except Exception:
         log.debug("Failed to append %s cycle-outcome checkpoint", source, exc_info=True)
 

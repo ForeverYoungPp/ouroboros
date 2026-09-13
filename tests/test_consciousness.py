@@ -210,3 +210,224 @@ class TestBackgroundConsciousnessCost(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------------------------------------- #
+# An over-ceiling prompt must not be a dead end
+# --------------------------------------------------------------------------- #
+
+
+def _bare_consciousness():
+    from ouroboros.consciousness import BackgroundConsciousness
+
+    return BackgroundConsciousness.__new__(BackgroundConsciousness)
+
+
+def test_an_over_ceiling_prompt_retries_on_the_task_local_low(monkeypatch):
+    """Grooming happens INSIDE a cycle, so a wake-up that aborts before its first
+    round can never shrink the memory that overflowed it. Over the ceiling, the
+    cycle rebuilds ONCE on the Low projection instead of stalling forever."""
+    bc = _bare_consciousness()
+    seen = {}
+
+    def fake_build(observations, context_mode=""):
+        seen["mode"] = context_mode
+        return "x" * 10 if context_mode == "low" else "y" * 5_000
+
+    monkeypatch.setattr(bc, "_build_cycle_context", fake_build)
+    messages = [
+        {"role": "system", "content": "y" * 5_000},
+        {"role": "user", "content": "Wake up. Think."},
+    ]
+
+    assert bc._degrade_context_for_size(
+        messages, [], provider="openai", effort="medium", tools=[]
+    ) is True
+    assert seen["mode"] == "low"
+    assert messages[0]["content"] == "x" * 10
+    assert messages[1]["content"] == "Wake up. Think."
+
+
+def test_a_low_projection_that_does_not_shrink_is_declined(monkeypatch):
+    """One retry, not a loop: if Low is not smaller, the caller keeps its abort
+    path and its overflow disclosure rather than re-rendering forever."""
+    bc = _bare_consciousness()
+    monkeypatch.setattr(
+        bc, "_build_cycle_context", lambda observations, context_mode="": "y" * 5_000
+    )
+    messages = [{"role": "system", "content": "y" * 5_000}, {"role": "user", "content": "Wake."}]
+
+    assert bc._degrade_context_for_size(
+        messages, [], provider="openai", effort="medium", tools=[]
+    ) is False
+    assert messages[0]["content"] == "y" * 5_000
+
+
+def test_governance_sections_honour_a_task_local_low(tmp_path):
+    """The mechanism the retry relies on: the same env renders the full doc in
+    max and the navigation map in low, and the owner's global mode is untouched."""
+    from types import SimpleNamespace
+
+    from ouroboros.config import get_context_mode
+    from ouroboros.context import build_governance_sections
+
+    repo = tmp_path / "repo"
+    (repo / "docs").mkdir(parents=True)
+    (repo / "BIBLE.md").write_text("# BIBLE\n\nprinciple", encoding="utf-8")
+    body = "\n\n".join(
+        f"## Section {i}\n\n" + ("detail line\n" * 200) for i in range(1, 12)
+    )
+    (repo / "docs" / "ARCHITECTURE.md").write_text(body, encoding="utf-8")
+    env = SimpleNamespace(repo_path=lambda rel: repo / rel)
+
+    before = get_context_mode()
+    full = "\n\n".join(build_governance_sections(env, context_mode="max"))
+    low = "\n\n".join(build_governance_sections(env, context_mode="low"))
+
+    assert len(low) < len(full)
+    assert "detail line" in full
+    assert get_context_mode() == before  # a task-local Low never leaks into the global
+
+
+# --------------------------------------------------------------------------- #
+# The WIRING: one real cycle, over the ceiling
+# --------------------------------------------------------------------------- #
+# The helpers above are green either way. Production measured 1,319,625 physical
+# bytes against a 1,200,000 ceiling, so every wake-up aborted forever — what was
+# broken was `_think_scoped`'s use of them, which nothing pinned. A full LLM round
+# is not the point, so the four seams below are patched; everything else (the real
+# class, the real context assembly, the real receipts) runs.
+
+
+def _bg_cycle_env(engram_stub):
+    """Repo/drive layout the real `_build_context` needs, on the shared stub env."""
+    state, env = engram_stub
+    repo, drive = env.repo_dir, env.drive_root
+    for path in (repo / "docs", repo / "prompts", drive / "memory", drive / "logs", drive / "state"):
+        path.mkdir(parents=True, exist_ok=True)
+    # Big enough that the Low projection is genuinely smaller (it replaces this
+    # document with a navigation map), which is what the degrade decision rests on.
+    (repo / "docs" / "ARCHITECTURE.md").write_text(
+        "\n\n".join(f"## Section {i}\n\n" + ("detail line\n" * 120) for i in range(1, 12)),
+        encoding="utf-8",
+    )
+    (repo / "docs" / "DEVELOPMENT.md").write_text("# Dev", encoding="utf-8")
+    (repo / "prompts" / "SYSTEM.md").write_text("base prompt", encoding="utf-8")
+    (repo / "BIBLE.md").write_text("# BIBLE\n\nprinciple", encoding="utf-8")
+    (drive / "memory" / "identity.md").write_text("I am a test identity.", encoding="utf-8")
+    (drive / "memory" / "WORLD.md").write_text("host: test", encoding="utf-8")
+    (drive / "memory" / "scratchpad.md").write_text("scratchpad body", encoding="utf-8")
+    (drive / "logs" / "chat.jsonl").write_text("", encoding="utf-8")
+    (drive / "state" / "state.json").write_text("{}", encoding="utf-8")
+    return state, env
+
+
+def _wire_cycle(engram_stub, monkeypatch, measure):
+    """A real cycle with only the LLM-size/LLM seams replaced.
+
+    ``measure`` gets the physical-size call count. Returns (bc, rebuilds, events,
+    thought-calls) where ``rebuilds`` records every context build as
+    ``(context_mode, observations, text)`` — including the ones `_think_scoped`
+    itself makes, so the mode and the snapshot identity are assertable rather than
+    assumed.
+    """
+    from ouroboros import llm_observability, openai_chat_dispatch
+    from ouroboros.consciousness import BackgroundConsciousness
+    from ouroboros.engram_sink import reset_sinks
+
+    state, env = _bg_cycle_env(engram_stub)
+    reset_sinks()
+    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", "max")  # the global mode the degrade departs from
+    with patch.object(BackgroundConsciousness, "_build_registry", return_value=MagicMock()):
+        bc = BackgroundConsciousness(
+            drive_root=env.drive_root,
+            repo_dir=env.repo_dir,
+            event_queue=None,
+            owner_chat_id_fn=lambda: None,
+        )
+    monkeypatch.setattr(bc, "_tool_schemas", lambda: [])
+    monkeypatch.setattr(bc._llm, "_resolve_remote_target", lambda model: {"provider": "openai"})
+    monkeypatch.setattr(bc, "_check_budget", lambda: True)
+
+    real_build = bc._build_cycle_context
+    rebuilds: list = []
+
+    def recording_build(observations, context_mode=""):
+        text = real_build(observations, context_mode=context_mode)
+        rebuilds.append((context_mode, observations, text))
+        return text
+
+    monkeypatch.setattr(bc, "_build_cycle_context", recording_build)
+
+    round_usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2, "cost": 0.0}
+    monkeypatch.setattr(
+        llm_observability,
+        "chat_observed",
+        lambda *args, **kwargs: ({"role": "assistant", "content": "one thought", "tool_calls": []}, dict(round_usage)),
+    )
+    monkeypatch.setattr(openai_chat_dispatch, "projected_context_size_bytes", measure)
+
+    events_path = env.drive_root / "logs" / "events.jsonl"
+    def _events():
+        if not events_path.exists():
+            return []
+        return [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    return bc, rebuilds, _events
+
+
+def test_an_over_ceiling_cycle_rebuilds_on_the_low_projection_and_records_it(engram_stub, monkeypatch):
+    """One real cycle, over the ceiling on its first measurement: it must rebuild
+    the system prompt with ``context_mode="low"`` for the SAME observation
+    snapshot, retry on exactly that compact text (not merely "some rebuild"), and
+    disclose the deviation — otherwise the loop is the one that aborted forever."""
+    from ouroboros.consciousness import BG_CONTEXT_MAX_CHARS
+
+    measured: list = []
+
+    def measure(messages, tools=None, provider="", reasoning_effort=None):
+        measured.append(str(messages[0]["content"]))
+        # Over the ceiling first, under it once the prompt has been rebuilt.
+        return BG_CONTEXT_MAX_CHARS + 500 if len(measured) == 1 else 1_000
+
+    bc, rebuilds, events = _wire_cycle(engram_stub, monkeypatch, measure)
+
+    assert bc._think_scoped() is True, "the cycle aborted on the oversized prompt"
+
+    # 1. The rebuild asked for the LOW projection, for the cycle's OWN snapshot.
+    cycle_build, degrade_build = rebuilds[0], rebuilds[1]
+    assert cycle_build[0] == "", cycle_build[0]
+    assert degrade_build[0] == "low", degrade_build[0]
+    assert degrade_build[1] is cycle_build[1], "the rebuild used a different snapshot"
+
+    # 2. The retry used exactly the text that build returned.
+    assert len(measured) >= 2 and len(measured[1]) < len(measured[0])
+    assert measured[1] == degrade_build[2]
+
+    # 3. And the deviation is disclosed under its own reason.
+    degraded = [e for e in events() if e.get("type") == "consciousness_context_degraded"]
+    assert degraded and degraded[0]["reason"] == "task_local_low"
+    assert not [e for e in events() if e.get("type") == "consciousness_context_overflow"]
+    assert [e for e in events() if e.get("type") == "consciousness_thought"], "the cycle did not finish"
+
+
+def test_a_prompt_still_over_the_ceiling_aborts_with_its_receipt(engram_stub, monkeypatch):
+    """The disclosure path has to survive the fix: when even the Low projection is
+    over the ceiling, the cycle must still abort AND say so durably."""
+    from ouroboros.consciousness import BG_CONTEXT_MAX_CHARS
+
+    measured: list = []
+
+    def measure(messages, tools=None, provider="", reasoning_effort=None):
+        measured.append(str(messages[0]["content"]))
+        return BG_CONTEXT_MAX_CHARS + 500
+
+    bc, rebuilds, events = _wire_cycle(engram_stub, monkeypatch, measure)
+
+    assert bc._think_scoped() is False
+    assert rebuilds[1][0] == "low", "the retry did not even ask for the Low projection"
+
+    overflow = [e for e in events() if e.get("type") == "consciousness_context_overflow"]
+    assert overflow, "the abort lost its disclosure"
+    assert "too large" in overflow[0]["error"]
+    assert not [e for e in events() if e.get("type") == "consciousness_thought"]

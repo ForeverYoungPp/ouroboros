@@ -102,6 +102,10 @@ MagicMock/
 # deliberately does not measure, and leaving them untracked dirties the seed gate.
 devtools/benchmarks/editbench/fixtures_v2/
 
+# The Engram packet and phase scratch (diffs, plans, runbooks): owner/agent
+# working material that must never be swept into a commit by `git add -A`.
+.ouroboros/
+
 .ua/
 .arbor/
 .autoresearch/

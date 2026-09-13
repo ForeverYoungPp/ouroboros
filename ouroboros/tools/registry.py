@@ -1417,6 +1417,11 @@ _EPHEMERAL_ALLOWED_TOOLS = frozenset({
     "analyze_screenshot", "vlm_query",
     # decide / route / spawn-owner-task / reply
     "route_to_project", "promote_chat_to_task", "steer_task", "list_projects", "send_photo",
+    # Owner ruling (CW3): the ephemeral decision turn's OWN prompt carries the Engram
+    # recall injection, whose seam text reads "Use the `engram` tool" for the bodies —
+    # and CW3 skips only WRITES (supervisor/workers.py:1300-1301). Read-only, self-budgeted
+    # (3 reads / 30,345 chars per turn), so the lane can act on the pointer it is given.
+    "engram",
 })
 
 
@@ -1573,7 +1578,7 @@ class ToolRegistry:
 
     _FROZEN_TOOL_MODULES = [
         "browser", "ci", "claude_advisory_review", "compact_context", "control",
-        "core", "delegate", "edit_ops", "evolution_stats", "followup", "git", "git_pr", "git_rollback", "github",
+        "core", "delegate", "edit_ops", "engram", "evolution_stats", "followup", "git", "git_pr", "git_rollback", "github",
         "health", "join_ledger", "knowledge", "media", "memory_tools", "plan_review", "project_journal", "presence",
         "recent_tasks",
         "query_code", "review", "search", "services", "shell", "skill_exec", "skill_publish",
@@ -1874,15 +1879,27 @@ class ToolRegistry:
             for available, reason, detail in [_builtin_tool_availability(entry.name, self._ctx)]
             if not available and reason == "missing_credential" and entry.name not in disabled_tools
         }
+
+        def _tool_admissible(entry: Any) -> bool:
+            """Every filter EXCEPT the ephemeral allowlist.
+
+            Split out so the allowlist's own rejections can be reported instead of
+            vanishing: a withheld built-in is a capability the lane may assume it
+            has, and the two other surfaces already disclose theirs.
+            """
+            return (
+                not entry.alias_for  # compat aliases are callable, never advertised
+                and entry.name not in disabled_tools  # declarative tool policy (task_contract.disabled_tools)
+                and _presence_tool_allowed(self._ctx, entry.name)
+                and entry.name not in unavailable_tools
+                and (not local_readonly_subagent or self._readonly_tool_allowed(entry.name))
+                and (not acting_subagent or entry.name in ACTING_SUBAGENT_TOOL_NAMES)
+            )
+
         built_in = [
             schema
             for entry in self._entries.values()
-            if not entry.alias_for  # compat aliases are callable, never advertised
-            if entry.name not in disabled_tools  # declarative tool policy (task_contract.disabled_tools)
-            if _presence_tool_allowed(self._ctx, entry.name)
-            if entry.name not in unavailable_tools
-            if not local_readonly_subagent or self._readonly_tool_allowed(entry.name)
-            if not acting_subagent or entry.name in ACTING_SUBAGENT_TOOL_NAMES
+            if _tool_admissible(entry)
             if not ephemeral_turn or entry.name in _EPHEMERAL_ALLOWED_TOOLS  # CW3: default-deny allowlist
             for schema in self._schemas_for_entry(entry)
         ]
@@ -1895,6 +1912,23 @@ class ToolRegistry:
                 "tools": sorted(unavailable_tools),
                 "details": {name: unavailable_tools[name] for name in sorted(unavailable_tools)},
             })
+        if ephemeral_turn:
+            # CW3: the allowlist removes the built-ins a short decision turn might
+            # assume are present — the whole Engram/knowledge surface among them.
+            # The extensions (:1900) and mcp (:1937) surfaces each get a row; without
+            # this one the lane can only learn its own shape by probing for tools it
+            # does not hold, which is exactly how it had to.
+            withheld_tools = sorted(
+                entry.name
+                for entry in self._entries.values()
+                if _tool_admissible(entry) and entry.name not in _EPHEMERAL_ALLOWED_TOOLS
+            )
+            if withheld_tools:
+                self._capability_omissions.append({
+                    "surface": "tools",
+                    "reason": "ephemeral_turn",
+                    "tools": withheld_tools,
+                })
         # Include live extension tool schemas in normal tool discovery.
         extension_schemas: List[Dict[str, Any]] = []
         if ephemeral_turn:

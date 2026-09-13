@@ -130,6 +130,46 @@ def _chat_history_snapshot_id(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _scratchpad_block_title(block: Dict[str, Any], source: str) -> str:
+    """The block's OWN first line, so a mirrored block is recognisable in a list.
+
+    The old constant ("Scratchpad block (task)") made every mirrored block
+    indistinguishable in a retrieval list — three of the five blocks in the live
+    recall window carried it. No identity prefix is added: the record's ``type`` is
+    already ``scratchpad_block`` and its topic key is ``scratchpad:<fingerprint>``,
+    so searchability does not depend on the title, while a prefix would spend the
+    title cap on a word the reader already has. The sink's ``_sanitize`` applies
+    ``FIELD_CAP_CHARS`` to whatever this returns.
+
+    Falls back to the old constant when the content has no non-empty line: an empty
+    title is refused by the sink, and a refusal would drop the mirror entirely.
+    """
+    for line in str(block.get("content") or "").splitlines():
+        if line.strip():
+            return line.strip()
+    return f"Scratchpad block ({source or 'task'})"
+
+
+def _scratchpad_block_fingerprint(block: Dict[str, Any]) -> str:
+    """Stable identity for one scratchpad block, used as its Engram topic key.
+
+    Content-addressed rather than timestamp-addressed: a spool retry after a crash
+    must land on the SAME record (C17 idempotency), and two blocks written in the
+    same second by different sources must not collapse into one.
+    """
+    payload = json.dumps(
+        {
+            "ts": str(block.get("ts") or ""),
+            "source": str(block.get("source") or ""),
+            "content": str(block.get("content") or ""),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
 class Memory:
     def __init__(self, drive_root: pathlib.Path, repo_dir: Optional[pathlib.Path] = None):
         self.drive_root = drive_root
@@ -274,11 +314,112 @@ class Memory:
                 "source": source,
                 "metadata": dict(metadata or {}),
                 "block": dict(new_block),
+                # S3: where the Engram mirror of this block ended up. Recorded per
+                # block rather than logged once, so "the working memory is also in
+                # Engram" stays an auditable claim rather than an assumption.
+                "engram_mirror": self._mirror_block_to_engram(new_block, source=source),
             })
         except Exception:
             log.debug("Failed to write scratchpad size to journal", exc_info=True)
 
         return new_block
+
+    def _mirror_block_to_engram(self, block: Dict[str, Any], *, source: str) -> str:
+        """Mirror one scratchpad block into Engram. Returns a status token, never raises.
+
+        The local store stays the source of truth for the prompt section (see
+        ``prompts/SYSTEM.md``: the scratchpad is working state, not reference
+        material — see also the AC11/AC-S3 resolution in the phase log). This is the
+        additive half: the agent's working memory becomes a durable remote memory
+        too, retrievable when the local drive is gone.
+
+        Identity is a fingerprint of the block itself, so a spool retry after a
+        crash updates the same record instead of appending a duplicate (C17).
+        """
+        try:
+            from ouroboros.engram_sink import sink_for
+
+            fingerprint = _scratchpad_block_fingerprint(block)
+            receipt = sink_for(self).emit(
+                "memory_action",
+                title=_scratchpad_block_title(block, source),
+                content=str(block.get("content") or ""),
+                identity=f"scratchpad:{fingerprint}",
+                type="scratchpad_block",
+                scope="global",
+                document=True,
+                fields={"source": str(source or ""), "block_ts": str(block.get("ts") or "")},
+            )
+            if receipt.accepted:
+                return "sent" if receipt.status == "sent" else "spooled"
+            # A to-do-shaped block is CORRECTLY refused (C18) — the working memory
+            # may legitimately hold "what I am doing next", and that is not a
+            # memory. The refusal is recorded rather than hidden so the partial
+            # mirror is visible in the journal instead of looking like a success.
+            return f"skipped:{receipt.reason or receipt.status}"
+        except Exception as exc:
+            log.debug("Scratchpad Engram mirror failed", exc_info=True)
+            return f"failed:{type(exc).__name__}"
+
+    def retitle_scratchpad_mirrors(self, *, batch: int = 20, dry_run: bool = False) -> Dict[str, Any]:
+        """Re-emit the scratchpad blocks whose Engram copy still carries the old title.
+
+        ONE-SHOT and SELF-TERMINATING: every block it re-titles has its fingerprint
+        recorded in ``state/scratchpad_retitle.json``, so a second run emits NOTHING.
+        The marker is written AFTER the emits (a crash re-runs only the unmarked
+        blocks, and the re-emit is an identity-keyed upsert either way).
+
+        Deliberately NOT a boot action: nothing depends on the titles being current,
+        and a per-boot re-emit of the whole set is exactly the "dedupe window ==
+        unacked window => re-push every start" shape v6.114.22 removed for the
+        dialogue blocks. The only caller is the packet runner
+        (``.ouroboros/engram-packet/retitle_scratchpad_blocks.py``, dry-run by
+        default), and it is nowhere near the boot path.
+
+        Batched through ``begin_engram_run`` because the per-run emit cap (C3) is 20
+        and a legacy file can hold more blocks than that. Returns a tally dict.
+        """
+        from ouroboros.engram_sink import begin_engram_run
+
+        marker_path = self.drive_root / "state" / "scratchpad_retitle.json"
+        done: set = set()
+        if marker_path.exists():
+            try:
+                payload = json.loads(marker_path.read_text(encoding="utf-8"))
+                done = {str(item) for item in (payload.get("retitled") or [])}
+            except Exception:
+                log.debug("Unreadable scratchpad re-title marker; treating as empty", exc_info=True)
+                done = set()
+
+        blocks = self.load_scratchpad_blocks()
+        todo = [b for b in blocks if _scratchpad_block_fingerprint(b) not in done]
+        tally: Dict[str, Any] = {
+            "blocks": len(blocks),
+            "already_retitled": len(blocks) - len(todo),
+            "re_emitted": 0,
+            "marker": str(marker_path),
+            "dry_run": bool(dry_run),
+        }
+        if not todo or dry_run:
+            return tally
+
+        sent = 0
+        size = max(1, int(batch))
+        for start in range(0, len(todo), size):
+            begin_engram_run(self)
+            for block in todo[start:start + size]:
+                status = self._mirror_block_to_engram(
+                    block, source=str(block.get("source") or "task"),
+                )
+                if status.startswith(("sent", "spooled")):
+                    sent += 1
+                    done.add(_scratchpad_block_fingerprint(block))
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(
+            json.dumps({"retitled": sorted(done)}, indent=0), encoding="utf-8",
+        )
+        tally["re_emitted"] = sent
+        return tally
 
     def regenerate_scratchpad_md(self) -> None:
         bp = self.scratchpad_blocks_path()
@@ -822,7 +963,15 @@ class Memory:
             "matched_rows": len(suffix),
             "shown_rows": len(shown),
             "omitted_matching_rows": max(0, len(suffix) - len(shown)),
-            "omitted_matching_rows_unknown": bool(omitted_generations or bounded_prefix),
+            # Policy: the lane's bounded tail read is the canonical reader for the
+            # chat source — a prefix omission is DISCLOSED via its coverage gap
+            # entry, not unknown; the owner's ruling: identity may be updated from
+            # the bounded chat view.  A `generation_tail_rows_unscanned` omission,
+            # every other non-prefix gap kind, and an omitted generation are still
+            # real unknowns and still veto.
+            "omitted_matching_rows_unknown": bool(omitted_generations) or any(
+                gap.get("kind") != "generation_prefix_unscanned" for gap in gaps
+            ),
             "gaps": gaps,
             "reader": "chat_history(count, offset, search)",
         }

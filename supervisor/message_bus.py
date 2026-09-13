@@ -1000,6 +1000,11 @@ def _send_markdown(
         progress_meta=progress_meta,
         role=role,
         system_type=system_type,
+        # v6.114.19: the parameter existed since v6.114.3 but was never
+        # forwarded, so every markdown frame reached the SPA identity-less
+        # while its durable row kept the field — the same row then rendered
+        # twice (live "Ouroboros" + replayed "🧠 Background") until a refresh.
+        sender_identity=sender_identity,
     )
 
 

@@ -134,16 +134,65 @@ def test_project_scoped_backlog_write_routes_to_global_store(tmp_path, monkeypat
 # C9.4 — consolidator validates topics through the single sanitizer
 # --------------------------------------------------------------------------- #
 
-def test_consolidator_skips_invalid_topic(tmp_path):
-    from ouroboros.consolidator import _write_knowledge_entries
+def test_consolidator_skips_invalid_topic(engram_stub):
+    """C9.4, retargeted: consolidation's knowledge output lands in Engram.
 
-    kdir = tmp_path / "knowledge"
+    Owner decision — consolidation's PROCESS is unchanged, but its fixed-knowledge
+    output goes to Engram. It does that by routing through the ONE knowledge
+    writer, so the sanitizer under test is the same one the tool uses; the
+    assertion moves from "a local file appeared" to "the valid topic reached
+    Engram and the invalid one did not".
+    """
+    from ouroboros.consolidator import _write_knowledge_entries
+    from ouroboros.engram_sink import reset_sinks
+
+    state, env = engram_stub
+    kdir = env.drive_root / "memory" / "knowledge"
+
     _write_knowledge_entries(kdir, [
         {"topic": "valid-topic", "content": "ok"},
         {"topic": "has spaces!", "content": "should be skipped"},
     ])
-    assert (kdir / "valid-topic.md").exists()
-    assert not list(kdir.glob("*spaces*"))
+
+    keys = [r["body"]["topic_key"] for r in state.requests
+            if r["path"] == "/observations" and isinstance(r.get("body"), dict)]
+    assert keys == ["knowledge:valid-topic"], keys
+    assert not list(kdir.glob("*spaces*")) if kdir.exists() else True
+    reset_sinks()
+
+
+def test_consolidation_appends_to_a_topic_instead_of_overwriting_it(engram_stub):
+    """Re-extracting a topic must not delete the earlier extraction.
+
+    Consolidation teaches more about a topic as more dialogue accumulates, so its
+    write APPENDS. It must stay that way: Engram's upsert replaces the body in
+    place and keeps no revision history, and the canonical local file is retired,
+    so an overwrite here would lose the earlier half from the only store holding
+    it — a BIBLE P1 loss, not a merge.
+    """
+    from ouroboros.consolidator import _write_knowledge_entries
+    from ouroboros.engram_sink import reset_sinks
+
+    state, env = engram_stub
+    kdir = env.drive_root / "memory" / "knowledge"
+
+    _write_knowledge_entries(kdir, [{"topic": "append-topic", "content": "first lesson"}])
+    # A later run: a fresh sink, so the append base has to be re-read from Engram
+    # rather than served from this process's own memory.
+    reset_sinks()
+    _write_knowledge_entries(kdir, [{"topic": "append-topic", "content": "second lesson"}])
+
+    written = [
+        record["body"]["content"]
+        for record in state.requests
+        if record["path"] == "/observations"
+        and isinstance(record.get("body"), dict)
+        and record["body"].get("topic_key") == "knowledge:append-topic"
+    ]
+    assert written, "the knowledge topic never reached Engram"
+    assert "first lesson" in written[-1], written[-1]
+    assert "second lesson" in written[-1], written[-1]
+    reset_sinks()
 
 
 # --------------------------------------------------------------------------- #

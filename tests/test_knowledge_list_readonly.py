@@ -53,22 +53,43 @@ def test_list_with_no_knowledge_dir_creates_nothing(tmp_path):
 
 
 def test_list_prefers_existing_index_verbatim(tmp_path):
-    """0-regression: when the write path has maintained an index, list returns it."""
+    """0-regression: when the write path has maintained an index, list returns it.
+
+    Re-anchored for the scope note (the draft adds one): the INDEX CONTENT is still
+    carried verbatim and the file is never rewritten on a read, while the result now
+    also names what the list is — the local archive — so a topic that lives only in
+    Engram cannot read as absent. Both facts are asserted; neither replaces the other.
+    """
     ctx = _Ctx(tmp_path / "drive")
     kdir = ctx.drive_root / "memory" / "knowledge"
     kdir.mkdir(parents=True)
-    (kdir / INDEX_FILE).write_text("# Knowledge Base Index\n\n- **a**: alpha\n", encoding="utf-8")
-    assert _knowledge_list(ctx) == "# Knowledge Base Index\n\n- **a**: alpha\n"
+    index_body = "# Knowledge Base Index\n\n- **a**: alpha\n"
+    (kdir / INDEX_FILE).write_text(index_body, encoding="utf-8")
+
+    listing = _knowledge_list(ctx)
+
+    assert index_body in listing, "the maintained index must be carried, not rebuilt"
+    assert "ARCHIVE INDEX" in listing, "the list must name its scope"
+    assert "Engram" in listing, "and the route to the remote records"
+    assert (kdir / INDEX_FILE).read_text(encoding="utf-8") == index_body, "a read never rewrites it"
 
 
-def test_first_write_into_indexless_store_seeds_the_full_index(tmp_path):
-    """#447 C1: the write path is now the ONLY index author, so a first write
-    into a store that has topic files but no index must seed ALL of them —
-    a one-topic seed would hide every pre-existing topic from later listings."""
+def test_first_write_into_indexless_store_seeds_the_full_index(tmp_path, monkeypatch):
+    """#447 C1, retargeted to the store whose write path still authors an index.
+
+    The guard is unchanged: a first write into a store that has topic files but no
+    index must seed ALL of them, because a one-topic seed would hide every
+    pre-existing topic from later listings. Only the PATH moved — S2 retired the
+    canonical local write, so the per-project facts store is now the only local
+    write path that maintains ``index-full.md``.
+    """
+    import ouroboros.config as cfg
+    from ouroboros.project_facts import project_knowledge_dir
     from ouroboros.tools.knowledge import _knowledge_write
 
-    ctx = _Ctx(tmp_path / "drive")
-    kdir = ctx.drive_root / "memory" / "knowledge"
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path / "data-root")
+    ctx = _Ctx(tmp_path / "drive", project_id="proj_idx")
+    kdir = project_knowledge_dir("proj_idx")
     kdir.mkdir(parents=True)
     (kdir / "alpha.md").write_text("# alpha\n\nSummary of alpha.\n", encoding="utf-8")
     (kdir / "beta.md").write_text("# beta\n\nSummary of beta.\n", encoding="utf-8")
@@ -80,3 +101,15 @@ def test_first_write_into_indexless_store_seeds_the_full_index(tmp_path):
     for topic in ("alpha", "beta", "gamma"):
         assert topic in listing, (topic, listing)
     assert (kdir / INDEX_FILE).exists()
+
+
+def test_canonical_write_no_longer_authors_a_local_index(tmp_path):
+    """S2: the canonical write path stops maintaining ``index-full.md`` too."""
+    from ouroboros.tools.knowledge import _knowledge_write
+
+    ctx = _Ctx(tmp_path / "drive")
+    _knowledge_write(ctx, topic="gamma", content="# gamma\n\nSummary of gamma.\n")
+
+    kdir = ctx.drive_root / "memory" / "knowledge"
+    assert not (kdir / INDEX_FILE).exists()
+    assert not (kdir / "gamma.md").exists()

@@ -93,6 +93,15 @@ on every restart, but one personality that remembers its path.
   the exact prompt/context, tool schema, model route, and model output
   that shaped a decision. A mind that remembers conclusions but cannot
   replay how they were formed remembers only a shadow of itself.
+- **Continuity is carried by durable stores, not by the prompt.** The
+  consolidated dialogue narrative is not billed into every prompt; it stays on
+  disk and is read on demand. Durable experience is retrieved from Engram by the
+  agent's own judgment (see `prompts/SYSTEM.md`, "Memory and Context"). This
+  moves *where* continuity is carried, never *whether* it is recoverable: the
+  prompt may shrink, the record may not. Nothing here relaxes the replay
+  requirement above — no compression, caching, or prompt-size optimisation may
+  make a past cognitive act unrecoverable, and a recorded history gap must stay
+  disclosed in the prompt rather than quietly omitted.
 - **Cognitive horizon is part of continuity.** Lowering the quality of
   the model, reasoning effort, token budget, or governance/memory context
   that supports core awareness is not a routine cost optimization. It is

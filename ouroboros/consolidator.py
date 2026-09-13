@@ -133,6 +133,20 @@ def consolidate(
             log.info("Chat block consolidation already running, skipping")
             return None
 
+        # A consolidation cycle IS one emit run (see
+        # BackgroundConsciousness._begin_cycle_emit_budget for the incident and the
+        # doctrine): the knowledge context this cycle writes through is a
+        # bare-drive sink whose C3 counter is otherwise never reset in this
+        # process, so a quota spent by an earlier cycle would refuse every later
+        # cycle's knowledge write BEFORE the spool. Reset only once the lock is
+        # held, so a skipped duplicate run cannot hand away another run's budget.
+        try:
+            from ouroboros.engram_sink import begin_engram_run
+
+            begin_engram_run(None)
+        except Exception:
+            log.debug("consolidation: emit budget reset failed", exc_info=True)
+
         return _run_block_consolidation(
             source_path=chat_path,
             blocks_path=blocks_path,
@@ -299,6 +313,14 @@ def _run_block_consolidation(
                 "ts": utc_now_iso(),
                 "type": "summary",
                 "range": range_str,
+                # The message offsets this block covers. `range` is minute-resolution
+                # timestamps, so a burst of BLOCK_SIZE messages inside one minute can
+                # hand two different chunks the SAME range string — and because the
+                # Engram mirror addresses a record by its interval, a collision there
+                # silently overwrites one interval with another (Bible P1). Offsets
+                # are unique by construction and stable when the same window is
+                # re-processed, which is exactly what that identity needs.
+                "offset_range": f"{last_offset + i * BLOCK_SIZE}-{last_offset + (i + 1) * BLOCK_SIZE}",
                 "message_count": len(chunk),
                 "content": content.strip(),
             })
@@ -315,6 +337,10 @@ def _run_block_consolidation(
     existing_blocks = _load_blocks(blocks_path)
     all_blocks = existing_blocks + new_blocks
 
+    # Defined OUTSIDE the branch: the mirror below reads it on every path, and a
+    # name that only exists inside an `if` raised a NameError that the mirror's own
+    # `except Exception` swallowed — the mirror silently did nothing.
+    era: Optional[Dict[str, Any]] = None
     if len(all_blocks) > MAX_SUMMARY_BLOCKS:
         compress_count = min(ERA_COMPRESS_COUNT, len(all_blocks) - 1)
         old_blocks = all_blocks[:compress_count]
@@ -349,12 +375,42 @@ def _run_block_consolidation(
 
     _write_locked_json(blocks_path, all_blocks)
 
+    # The cursor is made durable BEFORE the mirror, and that order is the point.
+    # A process that dies between the two leaves a block on disk with the cursor
+    # already past it — a state the next start repairs, because the boot
+    # carry-over pushes whatever intervals Engram is missing. The other order puts
+    # the whole mirror (one HTTP round trip per block, each with a timeout) inside
+    # the window where the block is durable and the cursor is not, so a death
+    # there re-summarises the SAME window on the next run and appends a second
+    # block for one interval.
     _advance_cursor(meta, segments, segment_sigs, segment_entries, last_offset + processed)
     meta["last_consolidated_at"] = utc_now_iso()
     atomic_write_json(meta_path, meta)
 
+    # Durable work is finished. Everything below is a best-effort follow-up, and
+    # the record of what was consolidated is written first so a mirror that hangs
+    # on an unreachable daemon cannot delay the operator-visible result.
     log.info("Block consolidation: %d messages -> %d new blocks (total %d)",
              processed, len(new_blocks), len(all_blocks))
+
+    # Mirror the blocks that were just distilled (W-dialogue). The local file
+    # stays the durable record; Engram is what the prompt seam reads now that
+    # `## Dialogue History` is gone. Identity is the INTERVAL a block covers, so a
+    # retried consolidation updates that interval's record instead of adding a
+    # second one for it. Soft: a memory-transport failure must never fail a
+    # consolidation that already succeeded on disk, and a block this misses is
+    # carried over on the next start.
+    try:
+        from ouroboros.engram_sink import push_local_dialogue_blocks
+
+        # The era block counts too: compressing four blocks into one creates a
+        # NEW record, and a mirror that skipped it would leave the distilled
+        # history readable only as its four un-compressed parts.
+        freshly_written = [*new_blocks, *([era] if era is not None else [])]
+        push_local_dialogue_blocks(blocks_path.parent.parent, freshly_written)
+    except Exception:
+        log.debug("Dialogue-block Engram mirror failed", exc_info=True)
+
     return total_usage
 
 
@@ -410,6 +466,25 @@ Create a detailed episodic memory entry from these {message_count} messages.
     return _call_consolidation_llm(llm_client, prompt, "Block summary LLM call")
 
 
+def _blocks_offset_range(blocks: List[Dict[str, Any]]) -> str:
+    """The message-offset interval a run of blocks covers, or ``""`` if unknown.
+
+    An era's own ``range`` is date-only, so two eras built from blocks that all
+    fall on the same day(s) would carry the SAME range string and collide in the
+    Engram mirror's interval identity — the older era silently overwriting the
+    newer. Deriving the span from the blocks instead keeps them distinct.
+
+    Blocks distilled before offsets were recorded have none, and ``""`` makes the
+    mirror fall back to their timestamps.
+    """
+    spans = [str(block.get("offset_range") or "") for block in blocks]
+    first = spans[0].split("-")[0] if spans and spans[0] else ""
+    last = spans[-1].split("-")[-1] if spans and spans[-1] else ""
+    if not first or not last:
+        return ""
+    return f"{first}-{last}"
+
+
 def _compress_blocks_to_era(
     blocks: List[Dict[str, Any]],
     llm_client: Any,
@@ -446,6 +521,7 @@ Write as Ouroboros (first person). Aim for 30-40% of original length.
         "ts": utc_now_iso(),
         "type": "era",
         "range": f"{start_date} to {end_date}",
+        "offset_range": _blocks_offset_range(blocks),
         "message_count": sum(b.get("message_count", 0) for b in blocks),
         "content": content.strip(),
     }
@@ -766,10 +842,10 @@ Respond with JSON only (no fences):
 
         from ouroboros.tools.knowledge import _knowledge_write_lock
 
+        # Knowledge FIRST, outside the lock: the one writer takes the same
+        # non-reentrant lock internally, so nesting would deadlock.
+        _write_knowledge_entries(knowledge_dir, result.get("knowledge_entries", []))
         with _knowledge_write_lock(knowledge_dir):
-            _write_knowledge_entries(
-                knowledge_dir, result.get("knowledge_entries", []), _locked=True,
-            )
             _rebuild_knowledge_index(knowledge_dir, _locked=True)
 
         compressed_block = {
@@ -821,36 +897,66 @@ Respond with JSON only (no fences):
         return None
 
 
+def _knowledge_ctx_for(knowledge_dir: pathlib.Path) -> Any:
+    """A canonical knowledge context for whichever layout this knowledge dir is.
+
+    ``<drive>/memory/knowledge`` is the canonical shape; anything else (a test
+    fixture, a project store) is treated as ``<root>/knowledge``.
+    """
+    from ouroboros.tools.registry import ToolContext
+
+    parent = knowledge_dir.parent
+    drive_root = parent.parent if parent.name == "memory" else parent
+    return ToolContext(repo_dir=drive_root, drive_root=drive_root)
+
+
 def _write_knowledge_entries(
     knowledge_dir: pathlib.Path,
     entries: List[Dict[str, Any]],
     *,
     _locked: bool = False,
 ) -> None:
-    # Validate topics through the ONE knowledge-topic validator (P7/C9.4) instead of
-    # a private char-filter that silently munged names into a different file than
-    # the knowledge tool would. An invalid topic is skipped + logged, never coerced.
-    from ouroboros.tools.knowledge import _sanitize_topic
+    """Send consolidation-extracted knowledge through the ONE knowledge writer.
 
-    if not _locked:
-        from ouroboros.tools.knowledge import _knowledge_write_lock
+    Owner decision: consolidation's PROCESS is unchanged — 100 messages per block,
+    4 blocks per era, scratchpad blocks distilled into knowledge — but its FIXED
+    KNOWLEDGE output belongs in Engram. Routing through ``_knowledge_write`` is what
+    makes that true without inventing a second knowledge path: that function owns
+    the topic validator, the write lock, the provenance history and the Engram
+    mirror, so this branch now lands exactly where every other knowledge write
+    lands.
 
-        with _knowledge_write_lock(knowledge_dir):
-            _write_knowledge_entries(knowledge_dir, entries, _locked=True)
-            _rebuild_knowledge_index(knowledge_dir, _locked=True)
-        return
+    ``mode="append"``, because this branch used to APPEND to the topic body and
+    still must: consolidation re-extracts a topic as new dialogue teaches more
+    about it, and the earlier extraction is not superseded — it is the other half.
+    Engram's upsert only bumps ``revision_count`` and keeps no revision history, so
+    an overwrite here would delete the prior body outright from the only store that
+    still has it (the canonical local file is retired), which is a P1 loss.
 
-    knowledge_dir.mkdir(parents=True, exist_ok=True)
+    ``_locked`` is accepted and IGNORED on purpose. ``_knowledge_write`` takes its
+    own lock, and that lock is a plain non-reentrant file lock — calling this from
+    inside one deadlocks rather than nesting. Callers must invoke it outside.
+    """
+    from ouroboros.tools.knowledge import _knowledge_write, _sanitize_topic
+
+    ctx = _knowledge_ctx_for(knowledge_dir)
     for entry in entries:
-        topic = entry.get("topic", "").strip()
-        kb_content = entry.get("content", "").strip()
-        if not topic or not kb_content:
+        topic = str(entry.get("topic") or "").strip()
+        content = str(entry.get("content") or "").strip()
+        if not topic or not content:
             continue
+        # Validate through the ONE knowledge-topic validator (P7/C9.4) instead of a
+        # private char-filter that silently munged names into a different file than
+        # the knowledge tool would. An invalid topic is skipped + logged, never
+        # coerced.
         try:
-            safe_topic = _sanitize_topic(topic)
+            _sanitize_topic(topic)
         except ValueError:
             log.debug("consolidator: skipping invalid knowledge topic %r", topic)
             continue
-        kb_path = knowledge_dir / f"{safe_topic}.md"
-        existing = read_text(kb_path) if kb_path.exists() else ""
-        write_text(kb_path, existing.rstrip() + "\n\n" + kb_content if existing else f"# {topic}\n\n{kb_content}\n")
+        try:
+            _knowledge_write(ctx, topic, content, mode="append")
+        except Exception:
+            # A learned lesson that silently fails to land is invisible learning
+            # erosion; warn so the loss is owner-greppable.
+            log.warning("consolidator: knowledge write failed for %r", topic, exc_info=True)

@@ -103,11 +103,73 @@ def _dulwich_tracked_paths(repo_dir: pathlib.Path) -> tuple[list[str], list[str]
         return [], [f"FATAL: {exc}"]
 
 
+#: Bounded Engram input for the review pack. The pack is a single long LLM call
+#: with a fixed budget, so the remote contribution must be a small digest, not a
+#: dump — the same discipline the file loop applies with
+#: ``_MAX_FULL_REPO_FILE_BYTES``.
+_ENGRAM_REVIEW_ITEMS = 12
+_ENGRAM_REVIEW_CHARS = 4_000
+
+
+def _engram_review_section(drive_root: pathlib.Path, repo_dir: Any = None) -> str:
+    """Bounded Engram-derived review input (C15 / AC17c). Never raises.
+
+    The knowledge / pattern / backlog files in ``_MEMORY_WHITELIST`` stop being
+    written once memory moves to Engram. Without this, the pack would quietly
+    collapse to identity + WORLD and the review would get *worse* while still
+    reporting success — the failure mode is silence, so it has to be named.
+
+    The scratchpad gets its own line because it is the one whitelist input whose
+    A4 reader has to be repointed explicitly (S3): the review must be able to say
+    how much of the agent's working memory it actually saw, including the case
+    where it saw none of it.
+    """
+    try:
+        from ouroboros.engram_read import client_for, digest, type_digest
+
+        # Scope from BOTH roots: the review holds them, and a bare drive root would
+        # resolve the project from ``.../data`` — filing this system's memories
+        # under a second project name.
+        client = client_for(_scope(drive_root, repo_dir))
+        read = digest(client, limit=_ENGRAM_REVIEW_ITEMS, max_chars=_ENGRAM_REVIEW_CHARS)
+        scratch = type_digest(
+            client, "scratchpad_block", limit=_ENGRAM_REVIEW_ITEMS, max_chars=_ENGRAM_REVIEW_CHARS
+        )
+    except Exception as exc:
+        return f"## ENGRAM MEMORY\n(not configured: {type(exc).__name__})\n"
+    if read.unknown:
+        return (
+            "## ENGRAM MEMORY\n(unavailable — memory presence is UNKNOWN for this review, "
+            "not absent; do not read this as 'nothing was learned')\n"
+        )
+    if read.status == "empty":
+        return "## ENGRAM MEMORY\n(no records for this project)\n"
+    body = f"## ENGRAM MEMORY ({read.count} records)\n{read.text}\n"
+    if scratch.status == "ok":
+        body += f"\n### Working memory in Engram ({scratch.count} block(s))\n{scratch.text}\n"
+    elif scratch.unknown:
+        body += (
+            "\n### Working memory in Engram\n(unavailable — whether the agent's working memory "
+            "was recorded is UNKNOWN for this review, not absent)\n"
+        )
+    else:
+        body += "\n### Working memory in Engram\n(no scratchpad block recorded for this project)\n"
+    return body
+
+
+def _scope(drive_root: Any, repo_dir: Any) -> Any:
+    """An env-shaped pair so the Engram scope resolves against the repository."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(drive_root=pathlib.Path(drive_root), repo_dir=repo_dir or drive_root)
+
+
 def _append_memory_whitelist(
     parts: list[str],
     skipped: list[str],
     *,
     drive_root: pathlib.Path,
+    repo_dir: Any = None,
 ) -> int:
     file_count = 0
     for rel_mem in _MEMORY_WHITELIST:
@@ -126,6 +188,10 @@ def _append_memory_whitelist(
             file_count += 1
         except Exception as exc:
             skipped.append(f"drive/{rel_mem} (read error: {exc})")
+    # The remote half of the same inputs. Counted separately from ``file_count``
+    # because it is not a file, and hiding that would make the pack's provenance
+    # a lie.
+    parts.append(_engram_review_section(drive_root, repo_dir))
     return file_count
 
 
@@ -242,7 +308,9 @@ def build_review_pack(
 
     skipped: list[str] = []
     memory_parts: list[str] = []
-    memory_count = _append_memory_whitelist(memory_parts, skipped, drive_root=drive_root)
+    memory_count = _append_memory_whitelist(
+        memory_parts, skipped, drive_root=drive_root, repo_dir=repo_dir
+    )
     memory_text = "\n".join(memory_parts)
 
     # Low context mode: render ARCHITECTURE.md as a navigation map (full sections

@@ -65,16 +65,20 @@ def test_build_llm_messages_repartitions_stable_vs_dynamic_sections():
     dynamic_text = messages[0]["content"][2]["text"]
 
     assert "## Identity" in stable_text
-    assert "## Knowledge base" in stable_text
-    assert "## Known error patterns (Pattern Register)" in stable_text
-    assert "## Last Deep Self-Review" in stable_text
+    # Reading side (AC10): the derived-experience sections leave the prompt.
+    # Durable knowledge and the Pattern Register are retrieved from Engram on
+    # demand now; the deep self-review was a measured broken read.
+    assert "## Knowledge base" not in stable_text
+    assert "## Known error patterns (Pattern Register)" not in stable_text
+    assert "## Last Deep Self-Review" not in stable_text
     assert "## Scratchpad" not in stable_text
     assert "## Dialogue History" not in stable_text
     assert "## Dialogue Summary" not in stable_text
     assert "## Memory Registry" not in stable_text
 
     assert "## Scratchpad" in dynamic_text
-    assert ("## Dialogue Summary" in dynamic_text) or ("## Dialogue History" in dynamic_text)
+    assert "## Dialogue Summary" not in dynamic_text
+    assert "## Dialogue History" not in dynamic_text
     assert "## Memory Registry (what I know / don't know)" in dynamic_text
     assert "## Memory Registry\n\n" not in dynamic_text
     assert "## Memory Registry (what I know / don't know)" not in stable_text
@@ -215,7 +219,8 @@ def test_build_memory_sections_partition_modes():
     assert any(section.startswith("## Identity") for section in stable)
     assert not any(section.startswith("## Scratchpad") for section in stable)
     assert any(section.startswith("## Scratchpad") for section in volatile)
-    assert any(
+    # Reading side (AC9): consolidation no longer renders into any partition.
+    assert not any(
         section.startswith("## Dialogue Summary") or section.startswith("## Dialogue History")
         for section in volatile
     )

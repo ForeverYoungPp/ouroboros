@@ -623,25 +623,37 @@ export function partitionLocalEchoJournal(journal, serverClientMessageIds) {
 /** Dedupe key for one rendered chat row; client_message_id wins when present. */
 export function buildMessageKey(role, text, timestamp, opts = {}) {
     if (opts.clientMessageId) return `client|${opts.clientMessageId}`;
+    // PARITY CONTRACT — the key may only use fields BOTH render paths know.
+    // The live WS frame carries {type, role, content, markdown, is_progress, ts,
+    // task_id, chat_id, transport, [system_type], [sender_identity]}
+    // (supervisor/message_bus.py:396-410); it has NO `source`, `sender_label` or
+    // `sender_session_id`, which the replay path passes straight off the durable
+    // row (web/modules/chat.js:2977-2990). With those in the key the SAME row
+    // hashed differently live vs on reload, so it rendered twice until a refresh
+    // rebuilt the list (the owner's "refreshing collapses it to one"). They are
+    // therefore out of the assistant/system keys. A user row keeps
+    // senderLabel/senderSessionId — its live echo DOES carry sender_session_id —
+    // and any row needing a source-distinguished identity carries a
+    // client_message_id, which short-circuits both branches.
     if (role !== 'user' && !opts.isProgress && opts.taskId) {
         return [
             'task',
             role,
             opts.systemType || '',
-            opts.source || '',
             opts.senderIdentity || '',
             opts.taskId,
             text,
         ].join('|');
     }
     if (!timestamp) return '';
+    const userIdentity = role === 'user'
+        ? [opts.senderLabel || '', opts.senderSessionId || '']
+        : [];
     return [
         role,
         opts.isProgress ? '1' : '0',
         opts.systemType || '',
-        opts.source || '',
-        opts.senderLabel || '',
-        opts.senderSessionId || '',
+        ...userIdentity,
         opts.senderIdentity || '',
         opts.taskId || '',
         timestamp,

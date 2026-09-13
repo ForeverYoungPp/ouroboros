@@ -32,13 +32,13 @@ from ouroboros.context_fit import (
     estimate_context_prompt_tokens as estimate_context_prompt_tokens,
 )
 from ouroboros.context_health import (
+    _STRAY_PROBE_CACHE as _STRAY_PROBE_CACHE,
+)
+from ouroboros.context_health import (
     _compute_cache_hit_rate as _compute_cache_hit_rate,
 )
 from ouroboros.context_health import (
     _iter_recent_jsonl as _iter_recent_jsonl,
-)
-from ouroboros.context_health import (
-    _STRAY_PROBE_CACHE as _STRAY_PROBE_CACHE,
 )
 from ouroboros.context_health import (
     _stray_server_note as _stray_server_note,
@@ -57,7 +57,6 @@ from ouroboros.utils import (
     read_json_dict,
     read_text,
     safe_relpath,
-    truncate_review_artifact,
     utc_now_iso,
 )
 
@@ -551,7 +550,11 @@ def _task_authority_projection(env: Any, task: Dict[str, Any]) -> Dict[str, Any]
     )
     from ouroboros.main_context_authority import project_main_task_authority
 
-    projection = project_main_task_authority(task, drive_root=canonical_root)
+    # Both roots: the Engram read inside the projection must resolve the
+    # project against the repository, not against ``.../data``.
+    projection = project_main_task_authority(
+        task, drive_root=canonical_root, repo_dir=getattr(env, "repo_dir", None)
+    )
     task_id = str(task.get("id") or "").strip()
     if not task_id:
         return projection
@@ -885,29 +888,40 @@ def build_knowledge_sections(
     project_id: str = "",
     warn_large: bool = False,
     pattern_header: str = "## Known error patterns (Pattern Register)",
+    include_derived_knowledge: bool = True,
 ) -> List[str]:
+    """Knowledge-base index, Pattern Register, and per-project working state.
+
+    ``include_derived_knowledge=False`` drops the two *derived-learning* inputs
+    (the knowledge index and the Pattern Register) while keeping the per-project
+    journal/workpad, which are live project working state rather than learning.
+    The main-chat assembly uses that — durable knowledge is retrieved from Engram
+    on demand now, but a project's own progress memory is not something the agent
+    should have to go and ask for. The default preserves every other caller.
+    """
     sections: List[str] = []
     # Knowledge base index: for a project-scoped task load ONLY the current
     # project's facts (`projects/<id>/knowledge`), isolated from the global
     # memory/knowledge tree and from any other project (Phase 3b). The Pattern
     # Register stays global (general error patterns are cross-project cognition).
     pid = str(project_id or "").strip()
-    if pid:
-        from ouroboros.project_facts import project_knowledge_dir
+    if include_derived_knowledge:
+        if pid:
+            from ouroboros.project_facts import project_knowledge_dir
 
-        knowledge_index = (project_knowledge_dir(pid) / "index-full.md", f"## Project knowledge ({pid})", "project knowledge index")
-    else:
-        knowledge_index = (env.drive_path("memory/knowledge/index-full.md"), "## Knowledge base", "knowledge index")
-    for path, header, label in (
-        knowledge_index,
-        (env.drive_path("memory/knowledge/patterns.md"), pattern_header, "patterns register"),
-    ):
-        text = safe_read(path)
-        if not text.strip():
-            continue
-        if warn_large and len(text) > _LARGE_CONTEXT_SECTION_CHARS:
-            log.warning("context: %s is large (%d chars)", label, len(text))
-        sections.append(f"{header}\n\n{text}")
+            knowledge_index = (project_knowledge_dir(pid) / "index-full.md", f"## Project knowledge ({pid})", "project knowledge index")
+        else:
+            knowledge_index = (env.drive_path("memory/knowledge/index-full.md"), "## Knowledge base", "knowledge index")
+        for path, header, label in (
+            knowledge_index,
+            (env.drive_path("memory/knowledge/patterns.md"), pattern_header, "patterns register"),
+        ):
+            text = safe_read(path)
+            if not text.strip():
+                continue
+            if warn_large and len(text) > _LARGE_CONTEXT_SECTION_CHARS:
+                log.warning("context: %s is large (%d chars)", label, len(text))
+            sections.append(f"{header}\n\n{text}")
     if pid:
         # Bounded per-project journal tail + workpad (multi-project, v6.32.0):
         # the project's durable progress memory rides along with its knowledge.
@@ -935,7 +949,10 @@ def build_knowledge_sections(
     return sections
 
 
-def build_governance_sections(env: Any, *, warn_large: bool = False, warn_label: str = "context") -> List[str]:
+def build_governance_sections(
+    env: Any, *, warn_large: bool = False, warn_label: str = "context",
+    context_mode: str = "",
+) -> List[str]:
     sections: List[str] = []
     bible_text = safe_read(env.repo_path("BIBLE.md"))
     if bible_text:
@@ -943,7 +960,12 @@ def build_governance_sections(env: Any, *, warn_large: bool = False, warn_label:
             log.warning("%s: BIBLE.md is large (%d chars)", warn_label, len(bible_text))
         sections.append("## BIBLE.md\n\n" + bible_text)
     # ARCHITECTURE: full in max, navigation map in low (context_layout SSOT).
-    arch_section = architecture_context_section(env, context_mode=get_context_mode())
+    # ``context_mode`` lets one caller request the cheap projection for a SINGLE
+    # build — the task-local Low a caller falls back to on confirmed overflow —
+    # without mutating the owner's global selection.
+    arch_section = architecture_context_section(
+        env, context_mode=context_mode or get_context_mode()
+    )
     if arch_section:
         sections.append(arch_section)
     else:
@@ -951,7 +973,39 @@ def build_governance_sections(env: Any, *, warn_large: bool = False, warn_label:
     return sections
 
 
-_SECTION_BUDGETS = {"scratchpad": SCRATCHPAD_SECTION_BUDGET_CHARS, "identity": 80_000, "registry": 30_000, "world": 16_000}
+#: How many remembered dialogue blocks one turn may surface.
+MAX_RECALL_ITEMS = 5
+#: Largest rendered recall section. The section it replaces had NO budget and
+#: reached 30,344 chars; a replacement without a bound would repeat that.
+DIALOGUE_RECALL_BUDGET_CHARS = 2_000
+#: The knowledge leg's OWN budget, ADDED to the recall total (it does not split the
+#: dialogue halves): at most MAX_KNOWLEDGE_RECALL_ITEMS titles, ~120 chars each plus
+#: its heading, so 1,000 leaves headroom. The section can now cost up to
+#: DIALOGUE_RECALL_BUDGET_CHARS + this, which is still far under the knowledge index
+#: (6,569 chars) the seam replaced.
+KNOWLEDGE_RECALL_BUDGET_CHARS = 1_000
+#: Item cap for the knowledge leg — below MAX_RECALL_ITEMS on purpose: it is a
+#: pointer list beside the dialogue halves, not a second result page.
+MAX_KNOWLEDGE_RECALL_ITEMS = 5
+#: When a section carries BOTH halves (query hits + newest summaries), each half
+#: gets this much of the budget, minus the two sub-headings that separate them.
+#: Split rather than shared, so a long hit list cannot squeeze the continuity
+#: block out of the section that exists to anchor it.
+_RECALL_HALF_BUDGET_CHARS = (DIALOGUE_RECALL_BUDGET_CHARS - 90) // 2
+#: The sub-headings a two-half section renders. The reader must be able to tell
+#: "matched what I asked" from "happened lately" without guessing.
+_RECALL_MATCHED_HEADING = "### Matched this query\n"
+_RECALL_NEWEST_HEADING = "### Newest remembered (continuity)\n"
+_RECALL_KNOWLEDGE_HEADING = "### Related knowledge (titles only)\n"
+
+#: Budget for the resident store-side knowledge index (``_knowledge_index_section``).
+#: Sized BELOW the 6,569-char local index this seam replaced, so reviving the tier-0
+#: element is a net reduction instead of a new cost: at the current topic set the whole
+#: index is ~4.8 K chars, so the budget binds only as the store grows, and when it does
+#: the omitted topics are NAMED with the path to the full index (never a silent clip).
+KNOWLEDGE_INDEX_BUDGET_CHARS = 4_000
+
+_SECTION_BUDGETS = {"scratchpad": SCRATCHPAD_SECTION_BUDGET_CHARS, "identity": 80_000, "registry": 30_000, "world": 16_000, "dialogue_recall": DIALOGUE_RECALL_BUDGET_CHARS + KNOWLEDGE_RECALL_BUDGET_CHARS}
 
 
 def _warn_if_over_budget(name: str, content: str) -> None:
@@ -960,7 +1014,245 @@ def _warn_if_over_budget(name: str, content: str) -> None:
         log.warning("Context section '%s' exceeds budget: %d chars > %d", name, len(content), budget)
 
 
-def build_memory_sections(memory: Memory, partition: str = "all", durable_dialogue_gaps_out: Optional[List[Dict[str, Any]]] = None) -> List[str]:
+_DURABLE_GAP_SECTION_MAX = 10
+_DURABLE_GAP_EXCERPT_CHARS = 240
+
+
+def _format_durable_gap_section(blocks: List[Dict[str, Any]]) -> str:
+    """Bounded disclosure of durable biography gaps (BIBLE P1).
+
+    A gap is a fact in memory, not a silent absence. The narrative section that
+    used to carry this fact left the prompt (see ``build_memory_sections``), so
+    the disclosure is rendered on its own instead of disappearing with it. It is
+    deliberately tiny and only emitted when a gap actually exists — the whole
+    point of dropping the narrative was that history is no longer billed to
+    every prompt.
+    """
+    lines: List[str] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        gap_id = str(block.get("gap_id") or "").strip()
+        content = str(block.get("content") or "")
+        if not gap_id and "[MEMORY GAP]" not in content:
+            continue
+        excerpt = content if "[MEMORY GAP]" in content else f"[MEMORY GAP] {content}"
+        lines.append(f"- {gap_id or '(unnamed gap)'}: {excerpt[:_DURABLE_GAP_EXCERPT_CHARS]}")
+        if len(lines) >= _DURABLE_GAP_SECTION_MAX:
+            break
+    if not lines:
+        return ""
+    return (
+        "## Memory Gaps (durable history discontinuities)\n\n"
+        "These spans are recorded as unknowable. Do not read the history around "
+        "them as complete, and do not rewrite identity across one.\n\n" + "\n".join(lines)
+    )
+
+
+def _engram_recall_section(memory: Memory, query: str = "") -> str:
+    """Relevant remembered history, straight from Engram. Never raises.
+
+    Fills the seam `## Dialogue History` occupied, with its content now living in
+    Engram: fetched per turn instead of billed to every prompt in full. Two
+    properties matter and pull in opposite directions, so the section carries
+    BOTH instead of trading one for the other:
+
+    * RELEVANCE - what the owner just said (for a wake-up, the newest pending
+      observation) is the retrieval query, and the hits for it are what make the
+      section worth its bytes. Engram's search is the retrieval, and it runs with
+      ``match_mode="any"``: under the server's default (FTS5 AND) a
+      natural-language query only matches a record holding EVERY one of its
+      tokens, so multi-word recall came back empty and the seam silently
+      answered with recency instead.
+    * CONTINUITY - the section it replaces was an unconditional narrative of
+      "what has been happening", not a keyword hit list. OR matching makes a
+      non-empty hit set the NORMAL outcome of a natural-language query, so hits
+      alone would quietly displace that narrative with keyword overlap. A
+      MULTI-WORD query therefore renders the newest summaries under their own
+      sub-heading beside the hits, inside the same budget, split between them. A
+      ONE-WORD query is exact under either match mode (OR and AND agree on a
+      single token), so it renders exactly the hits, as it always did; a query
+      that genuinely matches nothing still renders the newest blocks alone.
+
+    Layer 1 only: one title line per hit, never a body. Bodies are what the
+    `engram` tool is for, and shipping them here is how the removed 30 KB would
+    come straight back.
+
+    A THIRD leg carries KNOWLEDGE on the same query, under its own sub-heading and
+    with its own budget (``KNOWLEDGE_RECALL_BUDGET_CHARS``) rather than a share of
+    the two dialogue halves — so the recall total can now cost up to
+    ``DIALOGUE_RECALL_BUDGET_CHARS + KNOWLEDGE_RECALL_BUDGET_CHARS``. It renders only
+    when it has titles, and only on the multi-word path: a one-word query keeps
+    exactly the shape it had before this leg existed.
+    """
+    from ouroboros.engram_cache import cached_read
+    from ouroboros.engram_client import EngramConfigError
+    from ouroboros.engram_read import MachineRead, client_for, digest, search_titles
+
+    body = ""
+    status = "empty"
+    detail = ""
+    try:
+        client = client_for(memory)
+
+        def _newest(max_chars: int) -> Any:
+            # Small window on purpose: the recency read carries full bodies, so a
+            # 50-record pull to render 5 titles is pure over-fetch.
+            return digest(
+                client,
+                limit=MAX_RECALL_ITEMS,
+                max_chars=max_chars,
+                window=MAX_RECALL_ITEMS,
+            )
+
+        def _fetch() -> Any:
+            text = str(query or "").strip()
+            # A query with no alphanumeric character carries no keyword to retrieve
+            # on, and Engram's expression builders cannot represent it: under the
+            # default mode the WHOLE query is quoted, so `'" "'` becomes a
+            # multi-phrase expression whose production parsing is unverified, and
+            # under any-mode the empty fields are dropped, which the engine rejects
+            # (SQL error -> HTTP 500 -> typed `unavailable`, i.e. a healthy store
+            # reported as unreachable). Not sending the request avoids depending on
+            # either — the recency branch is the honest answer for a query with
+            # nothing to match. This also covers the single-token spellings, and it
+            # is provably sufficient: if ANY field holds an alphanumeric character,
+            # that field survives any-mode's quote-trim, so a real query can never
+            # fall into the empty-expression case.
+            if not text or not any(ch.isalnum() for ch in text):
+                return _newest(DIALOGUE_RECALL_BUDGET_CHARS)
+            # A one-word query renders exactly what it rendered before the
+            # continuity half existed — same request, same byte budget — because
+            # OR and AND agree on a single token, so there is nothing here to
+            # disambiguate. Only a multi-word query (the natural-language owner
+            # message, the wake-up's observation payload) splits the budget.
+            carry_newest = len(text.split()) > 1
+            found = search_titles(
+                client,
+                text,
+                type_name="dialogue_summary",
+                limit=MAX_RECALL_ITEMS,
+                max_chars=(
+                    _RECALL_HALF_BUDGET_CHARS if carry_newest
+                    else DIALOGUE_RECALL_BUDGET_CHARS
+                ),
+                # "any": a natural-language question shares only SOME words with
+                # the memory that answers it, and under Engram's default (FTS5
+                # AND) it can only match a block containing every token, so it
+                # returned nothing and the seam always fell through to recency.
+                # `carry_newest` above decides when asking for it is safe.
+                match_mode="any" if carry_newest else "",
+            )
+            hits = str(found.text or "").strip()
+            # Only a genuine "nothing matched" justifies the recency fallback. A
+            # refusal or an outage must keep its own status: falling back would
+            # overwrite it with "empty" and tell the reader there is no history.
+            if found.status == "empty" and not hits:
+                return _newest(DIALOGUE_RECALL_BUDGET_CHARS)
+            if not hits or not carry_newest:
+                return found
+            # A multi-word query is natural language, and an OR hit set is keyword
+            # OVERLAP — usually non-empty now, and no promise that the newest
+            # summaries (the continuity anchor) are in it. Carry both halves.
+            # The THIRD leg, with its OWN budget rather than a share of the dialogue
+            # halves: durability the dialogue summaries do not carry (a recipe, a
+            # gotcha, a decision) surfaces on the same query. Titles only, and absent
+            # entirely when nothing matches — an empty sub-heading would cost bytes
+            # to say nothing.
+            knowledge = search_titles(
+                client,
+                text,
+                type_name="knowledge",
+                limit=MAX_KNOWLEDGE_RECALL_ITEMS,
+                max_chars=KNOWLEDGE_RECALL_BUDGET_CHARS,
+                match_mode="any",
+            )
+            extra = ""
+            if knowledge.readable and knowledge.status == "ok":
+                titles = str(knowledge.text or "").strip()
+                if titles:
+                    extra = "\n\n" + _RECALL_KNOWLEDGE_HEADING + titles
+            newest = _newest(_RECALL_HALF_BUDGET_CHARS)
+            if not (newest.readable and newest.status == "ok" and str(newest.text or "").strip()):
+                return MachineRead(
+                    True,
+                    status="ok",
+                    count=int(found.count or 0),
+                    version=found.version,
+                    text=_RECALL_MATCHED_HEADING + hits + extra,
+                )
+            # ADVISORY bookkeeping of the SEARCH half — `count` sums the two halves
+            # (a record can be in both, so it can double-count) and `version`
+            # describes only the search result. Nothing renders them today (they
+            # reach the cache entry, and a query-keyed entry is never persisted), so
+            # a future consumer must NOT present them as "N memories": the halves
+            # are separate lists precisely because their overlap is unknown here.
+            return MachineRead(
+                True,
+                status="ok",
+                count=int(found.count or 0) + int(newest.count or 0),
+                version=found.version,
+                text=(
+                    _RECALL_MATCHED_HEADING + hits + "\n\n"
+                    + _RECALL_NEWEST_HEADING + str(newest.text).strip() + extra
+                ),
+            )
+
+        read = cached_read(
+            "recall", client, _fetch,
+            drive_root=memory.drive_root,
+            key=str(query or ""),
+            # The cache cap must cover BOTH legs, or the knowledge part would be cut
+            # by the cache rather than by its own budget.
+            max_chars=DIALOGUE_RECALL_BUDGET_CHARS + KNOWLEDGE_RECALL_BUDGET_CHARS,
+        )
+        status, body, detail = read.status, read.text, read.detail
+    except EngramConfigError:
+        # An unresolvable project is a configuration fact, not a transport
+        # outage: the store might be full of this project's history while the
+        # scope is mis-wired. The blank return would read as "no history", so
+        # this keeps status in the "presence is UNKNOWN" family.
+        status = "rejected"
+    except Exception:
+        return ""
+    if status == "stale":
+        # The CAUSE is not decoration: "the store refused" and "the store is down"
+        # send the operator to different fixes, and serving cache must not collapse
+        # the distinction the typed reads exist to preserve.
+        why = (
+            "the store REFUSED the re-read (a scope/session problem, not an outage)"
+            if "rejected" in detail
+            else "the memory service could not be reached this turn"
+        )
+        return (
+            "## Remembered History (Engram)\n\n"
+            f"(cached from the last successful read — {why}, so this may be BEHIND. "
+            "`chat_history` still reads the raw log.)\n\n"
+            + body[:DIALOGUE_RECALL_BUDGET_CHARS]
+        )
+    if status == "unavailable":
+        return (
+            "## Remembered History (Engram)\n\n"
+            "(the memory service could not be reached, so recalled history is UNKNOWN "
+            "for this turn - not absent. `chat_history` still reads the raw log.)"
+        )
+    if status == "rejected":
+        return (
+            "## Remembered History (Engram)\n\n"
+            "(the memory service refused this request - a scope/session problem, not an "
+            "empty memory. Do not read this as 'there is no history'.)"
+        )
+    if not body.strip():
+        return ""
+    return (
+        "## Remembered History (Engram)\n\n"
+        "Relevant recalled memory - titles only. Use the `engram` tool "
+        "(`op='timeline'`, then `op='read'`) for a body, or `chat_history` for the "
+        "raw log.\n\n" + body[:DIALOGUE_RECALL_BUDGET_CHARS]
+    )
+
+
+def build_memory_sections(memory: Memory, partition: str = "all", durable_dialogue_gaps_out: Optional[List[Dict[str, Any]]] = None, recall_query: str = "") -> List[str]:
     sections = []
 
     include_stable = partition in {"all", "stable"}
@@ -982,16 +1274,44 @@ def build_memory_sections(memory: Memory, partition: str = "all", durable_dialog
             sections.append("## Environment Profile (from `memory/WORLD.md` — already loaded; delete WORLD.md and restart to regenerate if the host environment changes)\n\n" + world_raw)
 
     if include_volatile:
+        # The seam `## Dialogue History` occupied. Its content lives in Engram
+        # now, so the SAME position is filled from there: what the owner just
+        # said retrieves the matches, the newest summaries ride along beside them
+        # for a multi-word query (relevance alone does not restore the
+        # unconditional narrative this section replaced), newest-first only when
+        # nothing matches, titles only, and hard-bounded.
+        recall_section = _engram_recall_section(memory, recall_query)
+        if recall_section:
+            _warn_if_over_budget("dialogue_recall", recall_section)
+            sections.append(recall_section)
+
+        # `## Dialogue History` used to be injected here from
+        # `dialogue_blocks.json`. Consolidation now exits the prompt: its blocks
+        # are LLM-authored, doubly lossy (100 msgs → block, 4 blocks → era at
+        # 30-40%), and unreclaimable by runtime compaction because they live in
+        # the system message — while duplicating the raw tail `## Recent chat`
+        # already carries. The blocks remain on disk as an on-demand retrieval
+        # layer (tools/core.py routes the read hint).
+        #
+        # The durable-gap projection is still computed: it is the "this span of
+        # history is unknowable" signal, and it has live consumers that are NOT
+        # this section — consciousness (consciousness.py), the chat_history
+        # snapshot id (memory.py `_chat_history_snapshot_id`) and context health.
+        # Dropping it with the section would silently retire a BIBLE P1
+        # disclosure.
         dialogue_blocks = memory.load_dialogue_blocks()
         if dialogue_blocks:
-            blocks_md = memory.format_blocks_as_markdown(dialogue_blocks)
-            if blocks_md.strip():
-                if durable_dialogue_gaps_out is not None:
-                    durable_dialogue_gaps_out.extend(memory._durable_dialogue_gaps(dialogue_blocks)[0])
-                sections.append("## Dialogue History\n\n" + blocks_md)
-        legacy_summary = safe_read(memory.drive_root / "memory" / "dialogue_summary.md").strip()
-        if legacy_summary:
-            sections.append("## Legacy Dialogue Summary (retired flat format, read-only fallback)\n\n" + legacy_summary)
+            gaps, _identities = memory._durable_dialogue_gaps(dialogue_blocks)
+            if durable_dialogue_gaps_out is not None:
+                durable_dialogue_gaps_out.extend(gaps)
+            # BIBLE P1: the gap must stay VISIBLE, not merely computable. Its
+            # old carrier was the narrative above, so it is re-rendered on its
+            # own — bounded, and only when a gap exists.
+            gap_section = _format_durable_gap_section(dialogue_blocks)
+            if gap_section:
+                sections.append(gap_section)
+        # `dialogue_summary.md` was a retired flat-format read-only fallback; the
+        # file does not exist on disk. It is no longer rendered.
 
     if partition == "all":
         registry_path = memory.drive_root / "memory" / "registry.md"
@@ -1183,6 +1503,55 @@ def build_recent_sections(
 
 
 
+def _engram_verdict_section(env: Any) -> str:
+    """Bounded Engram-backed review-verdict digest (S6). Never raises.
+
+    Emitted only when the local review ledger has nothing to say, and it keeps the
+    three states apart: an unreachable store reports UNKNOWN rather than rendering
+    as "no verdicts", because the two lead to opposite conclusions about whether
+    this repo has ever been reviewed.
+    """
+    from ouroboros.engram_cache import cached_read
+    from ouroboros.engram_client import EngramConfigError
+    from ouroboros.engram_read import client_for, type_digest
+
+    try:
+        client = client_for(env)
+        read = cached_read(
+            "verdict", client,
+            lambda: type_digest(client, "review_verdict"),
+            drive_root=getattr(env, "drive_root", None),
+        )
+    except EngramConfigError:
+        # An unresolvable project is a configuration fact, same family as the
+        # recall seam: presence is UNKNOWN, never "no verdicts".
+        return (
+            "## Review verdicts (Engram)\n\n"
+            "(the project scope could not be resolved — whether any verdict was "
+            "recorded is UNKNOWN for this turn, not absent)"
+        )
+    except Exception:
+        return ""
+    if read.stale:
+        return (
+            "## Review verdicts (Engram)\n\n"
+            f"(cached from the last successful read — {read.detail})\n\n{read.text}"
+        )
+    if read.unknown:
+        return (
+            "## Review verdicts (Engram)\n\n"
+            f"(could not be read: {read.status} — whether any verdict was recorded is "
+            "UNKNOWN for this turn, not absent)"
+        )
+    if read.status != "ok" or not read.text.strip():
+        return ""
+    return (
+        f"## Review verdicts (Engram, {read.count})\n"
+        "(historical — the live gate state is `review_status`)\n\n"
+        f"{read.text}"
+    )
+
+
 def _build_registry_digest(env: Any) -> str:
     reg_path = env.drive_path("memory/registry.md")
     if not reg_path.exists():
@@ -1307,6 +1676,62 @@ def _drive_state_section(env: Any) -> str:
             + "\n\n" + note)
 
 
+def _knowledge_index_section(env: Any) -> str:
+    """Bounded, WRITE-THROUGH index of the topics the store mirrors. MAIN CHAT ONLY.
+
+    BIBLE.md:116-118 names the "durable knowledge index" among the tier-0 elements that
+    must "stay always-loaded in full", and the main chat is the one assembly that stopped
+    carrying it (``include_derived_knowledge=False``, which dropped the retired LOCAL
+    archive index). This is its replacement: the store-side index, which can name
+    post-switch topics the archive never could.
+
+    Deliberately NOT injected into the background lane: BG already renders the full
+    archive index plus the Pattern Register through the un-gated builder (21,814 chars as
+    measured), so a titles-only list there would duplicate most of its rows with less
+    information per row. BG keeps the archive; this section closes the main-chat gap.
+
+    Shape follows ``_drive_state_section``: a bounded projection plus a NAMED-omission
+    disclosure and an on-demand pointer, never a silent clip (BIBLE P1).
+    """
+    try:
+        from ouroboros.tools.knowledge import knowledge_index_line, knowledge_index_rows
+
+        rows = knowledge_index_rows(env)
+    except Exception:
+        log.debug("knowledge index section unavailable", exc_info=True)
+        return ""
+    if not rows:
+        return ""
+
+    lines = [knowledge_index_line(row) for row in rows]
+    header = "## Knowledge index (titles only)\n\n"
+    base_note = (
+        f"Write-through index of the {len(rows)} topic(s) mirrored to Engram since the local "
+        "write was retired (titles only). It names what exists — it is not proof a record is "
+        "still present, so read one with `knowledge_read(topic=…)`. "
+        "The pre-switch archive stays at `memory/knowledge/index-full.md`."
+    )
+
+    def _render(shown: int) -> str:
+        note = base_note
+        if shown < len(lines):
+            note += (
+                f" {len(lines) - shown} older topic(s) are not listed here (budget "
+                f"{KNOWLEDGE_INDEX_BUDGET_CHARS} chars); the full index is "
+                "`read_file(root='runtime_data', path='memory/knowledge_index.jsonl')`."
+            )
+        body = "\n".join(lines[:shown])
+        return f"{header}{body}\n\n{note}" if shown else f"{header.rstrip()}\n\n{note}"
+
+    # The BUDGET COVERS THE SECTION, not just its rows: the disclosure has to fit inside
+    # the same bound, or the section would exceed what it claims to respect. Drop rows
+    # from the OLDEST end until it fits, and name what was dropped.
+    shown = len(lines)
+    while shown > 0 and len(_render(shown)) > KNOWLEDGE_INDEX_BUDGET_CHARS:
+        shown -= 1
+    return _render(shown)
+
+
 def _capture_context_core(
     env: Any,
     memory: Memory,
@@ -1413,19 +1838,31 @@ def _capture_context_core(
         log.debug("Failed to build Available subagents catalog", exc_info=True)
     semi_stable_parts.extend(build_memory_sections(context_memory, partition="stable"))
 
-    semi_stable_parts.extend(build_knowledge_sections(context_env, project_id=resolve_project_id(task)))
+    # Reading side (AC10): the derived-knowledge inputs leave the main chat
+    # prompt. Durable KNOWLEDGE lives in Engram and is retrieved on demand; the
+    # Pattern Register is still LOCAL (`memory/knowledge/patterns.md`, written by
+    # `reflection._update_patterns`) and is read on demand via
+    # `knowledge_read('patterns')`, which falls back to that local file when the
+    # store holds no `knowledge:patterns` record; the per-project journal/workpad
+    # stay, because they are live project working state rather than accumulated
+    # learning.
+    semi_stable_parts.extend(
+        build_knowledge_sections(
+            context_env,
+            project_id=resolve_project_id(task),
+            include_derived_knowledge=False,
+        )
+    )
 
-    deep_review_path = context_env.drive_path("memory/deep_review.md")
-    try:
-        if deep_review_path.exists():
-            dr_text = deep_review_path.read_text(encoding="utf-8")
-            if dr_text.strip():
-                semi_stable_parts.append(
-                    "## Last Deep Self-Review\n\n"
-                    + truncate_review_artifact(dr_text, limit=8000)
-                )
-    except Exception:
-        pass
+    # `## Last Deep Self-Review` used to be injected here for every task class.
+    # It is a derived-learning artefact (same class as the knowledge base) and it
+    # was measured as a broken read — the file's content was a build failure
+    # notice, not a review. It is no longer rendered; the file stays on disk and
+    # `deep_self_review` still consumes it directly as its own input.
+    #
+    # (The `## Improvement Backlog` digest below is untouched: it is gated to
+    # evolution/deep_self_review tasks, which genuinely need it as action input —
+    # it is the self-evolution queue, not prompt decoration.)
 
     semi_stable_text = "\n\n".join(semi_stable_parts)
 
@@ -1435,7 +1872,13 @@ def _capture_context_core(
     dynamic_parts = []
     if health_section:
         dynamic_parts.append(health_section)
-    dynamic_parts.extend(build_memory_sections(context_memory, partition="volatile"))
+    dynamic_parts.extend(build_memory_sections(
+        context_memory,
+        partition="volatile",
+        # The owner's message is the natural retrieval query, and this is the
+        # turn's own text - not a cached impression of it.
+        recall_query=str(task.get("text") or ""),
+    ))
 
     registry_digest = _build_registry_digest(context_env)
     if registry_digest:
@@ -1443,11 +1886,23 @@ def _capture_context_core(
     installed_skills = _build_installed_skills_section(context_env)
     if installed_skills:
         dynamic_parts.append(installed_skills)
+    # The tier-0 knowledge index (BIBLE.md:116-118), MAIN CHAT ONLY: the write-through
+    # store index replaces the derived-learning input this assembly deliberately dropped
+    # (`include_derived_knowledge=False` at the `build_knowledge_sections` call above),
+    # and is what makes a topic nameable at all. It is not gated by that flag — the flag
+    # governs the retired LOCAL archive index, this is its replacement. BG keeps the
+    # un-gated archive index it already renders through its own builder call.
+    knowledge_index = _knowledge_index_section(context_env)
+    if knowledge_index:
+        dynamic_parts.append(knowledge_index)
     dynamic_parts.extend([
         _drive_state_section(context_env),
         build_runtime_section(env, task, ctx=ctx),
         (
             "## Task Contract Discipline\n\n"
+            "Before planning, check `knowledge_read` and the `engram` tool for what is "
+            "already known about this work — retrieval is cheap and expected, and an "
+            "empty memory is not the default assumption. "
             "For non-trivial work, state your success criteria early in your plan or reasoning, "
             "then keep tool use, artifact production, and the final claim aligned with the "
             "visible task_contract. If task_acceptance_review is available and the work is "
@@ -1484,6 +1939,16 @@ def _capture_context_core(
                 )
                 if advisory_section:
                     dynamic_parts.append(advisory_section)
+            else:
+                # S6 read path. The local review ledger is a live STATE MACHINE
+                # (the commit gate's attempts, obligations and debts), so it stays
+                # local; Engram holds the verdicts. Without this, a lost or fresh
+                # drive made "No advisory runs recorded yet" the only answer the
+                # agent could get, even though the verdicts exist — and a durable
+                # verdict nobody can reach is not a memory.
+                verdict_section = _engram_verdict_section(context_env)
+                if verdict_section:
+                    dynamic_parts.append(verdict_section)
         except Exception:
             log.debug("Failed to build advisory review status section", exc_info=True)
 

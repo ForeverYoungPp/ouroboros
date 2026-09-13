@@ -1480,6 +1480,45 @@ def save_state(drive_root: pathlib.Path, state: AdvisoryReviewState) -> None:
         _save_state_unlocked(drive_root, state)
     finally:
         release_review_state_lock(drive_root, lock_fd)
+    _mirror_latest_verdict(drive_root, state)
+
+
+def _mirror_latest_verdict(drive_root: pathlib.Path, state: AdvisoryReviewState) -> None:
+    """Mirror the newest review verdict into Engram (W9). Never raises.
+
+    BOTH mutation paths call this — ``save_state`` and ``update_state``, the one
+    production actually uses — so it leans on TWO dedupes, neither of which is a
+    "remember the last verdict" cache: the sink's in-run identity+content check
+    (per instance, cleared at every run boundary) and, across processes, the spool
+    witness that answers "this exact record already went out from this drive". The
+    second one exists because a worker-pool boot of N processes each call this
+    once: ten identical ``review_verdict:<tid>:1`` upserts landed on ONE record
+    (``revision_count 36 -> 47``) before it. ``obligation_ids`` and the finding
+    bodies are deliberately NOT forwarded — those are work items, and Engram stores
+    memories, not to-dos (C18).
+    """
+    try:
+        attempt = state.latest_attempt()
+        if attempt is None:
+            return
+        fails = sum(
+            1
+            for finding in (attempt.critical_findings or [])
+            if isinstance(finding, dict) and str(finding.get("verdict") or "").upper() == "FAIL"
+        )
+        verdict = str(attempt.status or "").strip() or ("FAIL" if fails else "unknown")
+        row = {
+            "verdict": verdict,
+            "task_id": str(attempt.task_id or ""),
+            "attempt": int(attempt.attempt or 0),
+            "summary": str(attempt.block_reason or attempt.commit_message or ""),
+            "fail_findings": fails,
+        }
+        from ouroboros.engram_sink import emit_review_verdicts
+
+        emit_review_verdicts(drive_root, [row], task_id=str(attempt.task_id or ""))
+    except Exception:
+        return
 
 
 def update_state(
@@ -1494,9 +1533,20 @@ def update_state(
         state = _load_state_unlocked(drive_root, strict_attempt_authority=True)
         result = mutator(state)
         _save_state_unlocked(drive_root, state)
-        return state if result is None else result
     finally:
         release_review_state_lock(drive_root, lock_fd)
+    # W9 mirrors on THIS path too, and it is the path that matters: every
+    # production mutation goes through here, while ``save_state`` has no caller
+    # outside the tests. Mirroring only in ``save_state`` therefore sent no
+    # verdict at all, however many were recorded — while the prompt section that
+    # reads them kept rendering.
+    #
+    # Deliberately OUTSIDE the lock: the sink talks HTTP, and holding the
+    # review-state lock across a network call would block the commit gate. A
+    # mutator that raises propagates past this line, so a half-applied state is
+    # never mirrored.
+    _mirror_latest_verdict(drive_root, state)
+    return state if result is None else result
 
 
 def acquire_review_state_lock(

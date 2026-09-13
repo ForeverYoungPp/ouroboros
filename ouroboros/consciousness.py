@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 from ouroboros.config import get_consciousness_model, resolve_effort
 from ouroboros.context import (
+    _drive_state_section,
     build_governance_sections,
     build_health_invariants,
     build_knowledge_sections,
@@ -50,6 +51,77 @@ from ouroboros.utils import (
 )
 
 _OBSERVATIONS_REL = pathlib.Path("state") / "consciousness_observations.jsonl"
+
+
+@contextlib.contextmanager
+def observation_writer_lock(path: pathlib.Path):
+    """The shared sidecar JSONL writer lock for the observation store.
+
+    Module-level because a producer with no ``Consciousness`` handle (the
+    owner-delivery seam) still writes the SAME file, and the store's single
+    writer contract is the lock, not the class instance.
+    """
+
+    lock_path = jsonl_append_lock_path(path)
+    lock_fd = acquire_exclusive_file_lock(
+        lock_path,
+        timeout_sec=2.0,
+        stale_sec=10.0,
+        poll_sec=0.01,
+    )
+    if lock_fd is None:
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        release_exclusive_file_lock(lock_path, lock_fd)
+
+
+def append_observation_row(
+    drive_root: Any,
+    text: Any,
+    *,
+    source: str = "runtime",
+    kind: str = "text",
+    chat_id: Optional[int] = None,
+    payload: Any = None,
+    ref: Any = None,
+    observation_id: Optional[str] = None,
+) -> bool:
+    """Append ONE observation row without a ``Consciousness`` instance handle.
+
+    Same store, same lock, same canonical row contract as
+    ``Consciousness.inject_observation`` (which is the wake-up inbox's single
+    writer) — a producer holding only a drive root can therefore enqueue a note
+    instead of inventing a second store or a second schema. The reader cache is
+    signature-aware, so the running loop rebuilds and consumes the row on its
+    next wake exactly like one it enqueued itself.
+
+    Returns False (never raises) when the store cannot be locked or written: the
+    caller decides whether to fall back to its other transport.
+    """
+    row = {
+        "id": str(observation_id or uuid.uuid4().hex),
+        "source": str(source or "runtime"),
+        "kind": str(kind or "text"),
+        "time": utc_now_iso(),
+        "payload": payload if payload is not None else text,
+        "chat_id": chat_id,
+        "ref": ref,
+    }
+    path = pathlib.Path(drive_root) / _OBSERVATIONS_REL
+    try:
+        with observation_writer_lock(path) as locked:
+            if not locked:
+                log.error("Failed to lock background observation store %s", path)
+                return False
+            return BackgroundConsciousness._append_observation_line_locked(
+                path, {"op": "enqueue", **row}
+            )
+    except Exception:
+        log.warning("Failed to append background observation note", exc_info=True)
+        return False
 _OBSERVATION_SOURCE_REF = (
     "read_file(root='runtime_data', "
     "path='state/consciousness_observations.jsonl')"
@@ -58,6 +130,12 @@ _OBSERVATION_RENDER_LIMIT = 10
 _OBSERVATION_RENDER_CHARS = 12_000
 
 log = logging.getLogger(__name__)
+
+#: How many consecutive cycles may list a due set without reading one of its
+#: bodies before the cursor advances anyway. The read witness under-counts
+#: (``knowledge_read``/``chat_history`` verify without spending the tool budget),
+#: so an unbounded block here would re-inject the same memories forever.
+REVIEW_UNREAD_STREAK_LIMIT = 3
 
 
 class BackgroundConsciousness:
@@ -98,6 +176,12 @@ class BackgroundConsciousness:
         self._identity_source_requirements: Dict[str, pathlib.Path] = {}
         self._identity_source_reads: Dict[str, str] = {}
         self._identity_unresolved_sources: set[str] = set()
+        # Engram review cycle (C16): what this cycle read as "due", and whether
+        # the cycle actually finished.  Held per cycle so a paused, stopped or
+        # empty-thought wake-up never advances the decay clock for records it
+        # did not really consider.
+        self._review_batch_ids: tuple = ()
+        self._review_unread_streak: int = 0
 
         self._bg_spent_usd: float = 0.0
         self._bg_budget_pct: float = float(
@@ -130,24 +214,10 @@ class BackgroundConsciousness:
         event = getattr(self, "_stop_event", None)
         return bool(event is not None and event.is_set())
 
-    @contextlib.contextmanager
     def _observation_writer_lock(self, path: pathlib.Path):
-        """Use the same sidecar lock seam as append_jsonl for store transactions."""
+        """Delegate to the module-level seam: ONE writer-lock implementation."""
 
-        lock_path = jsonl_append_lock_path(path)
-        lock_fd = acquire_exclusive_file_lock(
-            lock_path,
-            timeout_sec=2.0,
-            stale_sec=10.0,
-            poll_sec=0.01,
-        )
-        if lock_fd is None:
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            release_exclusive_file_lock(lock_path, lock_fd)
+        return observation_writer_lock(path)
 
     @staticmethod
     def _append_observation_line_locked(path: pathlib.Path, row: Dict[str, Any]) -> bool:
@@ -719,6 +789,15 @@ class BackgroundConsciousness:
         if not hasattr(self, "_deferred_events"):
             self._deferred_events = []
         observation_snapshot = self._snapshot_pending_observations()
+        # A wake-up is one retrieval turn for the model-facing `engram` tool:
+        # its budget is keyed on (task_id, chat_id), both of which stay fixed for
+        # this process, so without this the 3-read cap would be spent once and
+        # every later cycle refused outright.
+        self._reset_retrieval_budget()
+        # The same reasoning for the EMIT cap, which is per RUN: a wake-up is one
+        # run, or the sink's 20 slots are spent once for the process's life and
+        # every later write is refused before the spool.
+        self._begin_cycle_emit_budget()
         try:
             context = self._build_cycle_context(observation_snapshot)
         except OverflowError as exc:
@@ -748,6 +827,9 @@ class BackgroundConsciousness:
         final_content = ""
         round_idx = 0
         all_pending_events = []
+        # One task-local Low retry is allowed per cycle when the physical prompt
+        # overshoots the ceiling (see _degrade_context_for_size).
+        degraded_for_size = False
 
         try:
             target = (
@@ -768,18 +850,41 @@ class BackgroundConsciousness:
                         reasoning_effort=effort,
                     )
                     if physical_chars > BG_CONTEXT_MAX_CHARS:
-                        error = (
-                            "Background consciousness physical context too large "
-                            f"({physical_chars:,} bytes including tools). "
-                            "Groom memory to continue."
-                        )
-                        self._last_idle_reason = "context_overflow"
-                        self._append_cycle_receipt(self._drive_root / "logs" / "events.jsonl", {
-                            "ts": utc_now_iso(),
-                            "type": "consciousness_context_overflow",
-                            "error": error,
-                        }, label="context overflow")
-                        return False
+                        if not degraded_for_size and self._degrade_context_for_size(
+                            messages, observation_snapshot,
+                            provider=str(target.get("provider") or ""),
+                            effort=effort, tools=tools,
+                        ):
+                            degraded_for_size = True
+                            physical_chars = projected_context_size_bytes(
+                                messages,
+                                tools,
+                                provider=str(target.get("provider") or ""),
+                                reasoning_effort=effort,
+                            )
+                            self._append_cycle_receipt(
+                                self._drive_root / "logs" / "events.jsonl",
+                                {
+                                    "ts": utc_now_iso(),
+                                    "type": "consciousness_context_degraded",
+                                    "physical_bytes": physical_chars,
+                                    "reason": "task_local_low",
+                                },
+                                label="context degraded",
+                            )
+                        if physical_chars > BG_CONTEXT_MAX_CHARS:
+                            error = (
+                                "Background consciousness physical context too large "
+                                f"({physical_chars:,} bytes including tools, even on the "
+                                "task-local Low projection). Groom memory to continue."
+                            )
+                            self._last_idle_reason = "context_overflow"
+                            self._append_cycle_receipt(self._drive_root / "logs" / "events.jsonl", {
+                                "ts": utc_now_iso(),
+                                "type": "consciousness_context_overflow",
+                                "error": error,
+                            }, label="context overflow")
+                            return False
                     if physical_chars > BG_CONTEXT_WARN_CHARS:
                         log.warning(
                             "consciousness: physical context is large "
@@ -942,6 +1047,13 @@ class BackgroundConsciousness:
                 self._last_idle_reason = "observation_ack_pending"
                 return False
 
+            # AC14(c): advance the review cycle only after the cycle genuinely
+            # completed.  A paused, stopped or empty-thought wake-up leaves the
+            # due set untouched, so the next wake-up sees exactly the same
+            # records rather than skipping memory it never actually considered.
+            if not self.is_paused and not self._stop_requested():
+                self._advance_review_cycle()
+
         except Exception as e:
             self._cycle_ack_allowed = False
             self._emit_live_log("llm_round_error", round=round_idx, model=model, error=repr(e))
@@ -956,6 +1068,116 @@ class BackgroundConsciousness:
             return False
 
         return True
+
+    def _cycle_reads(self) -> int:
+        """How many full records THIS cycle pulled (see ``_cycle_read_any_body``)."""
+        try:
+            from ouroboros.tools.engram import turn_usage
+
+            return int(turn_usage(self._registry._ctx).get("reads", 0))
+        except Exception:
+            return -1  # unknown, not zero: the guard must only ever loosen
+
+    def _cycle_read_any_body(self) -> bool:
+        """True when THIS cycle pulled at least one full memory record.
+
+        ``turn_usage`` is the model-facing tool's own accounting, and the cycle
+        resets it on entry — so a non-zero ``reads`` means a body really was
+        fetched during this wake-up (search/timeline only spend chars, which is
+        why they do not count). An unaccountable context (older harness shapes)
+        is treated as "read", so the guard can only ever ADD a disclosure, never
+        silently change whether the cycle advances.
+        """
+        return self._cycle_reads() != 0
+
+    def _advance_review_cycle(self) -> int:
+        """``POST /review/mark_reviewed`` for the records this cycle reviewed.
+
+        C16 advances the cycle through Engram's own endpoint; consciousness keeps
+        no watermark file of its own. Best-effort by construction: an unreachable
+        store must not fail a cycle that already finished its thinking, and the
+        unmarked records simply come back due on the next wake-up.
+        """
+        ids = tuple(getattr(self, "_review_batch_ids", ()) or ())
+        if not ids:
+            # Nothing due is not "unread": the counter must not carry into the
+            # next set, or the first unread cycle for a FRESH set would already
+            # be past the limit and consume it unread.
+            self._review_unread_streak = 0
+            return 0
+        # Drop the batch first: if marking dies halfway, the records that were
+        # not marked must be re-read next cycle rather than assumed consumed.
+        self._review_batch_ids = ()
+        # Reviewing a memory means having READ it. A cycle can list its due set
+        # and still consume it without ever pulling a body (the tool budget, a
+        # refusal, or the model simply never asking), and "reviewed" would then
+        # mean nothing. The tool's own accounting is the honest witness: it is
+        # reset at the start of THIS cycle, so a zero read count means no body
+        # was fetched in this turn.
+        if not self._cycle_read_any_body():
+            # The witness can UNDER-count: `knowledge_read` and `chat_history` are
+            # legitimate ways to inspect a record and neither spends the tool's
+            # read budget. So an unread cycle is evidence, not proof — and a hard
+            # gate on it would livelock the cursor (the same due set re-injected
+            # into every wake-up forever). Push back for a bounded number of
+            # cycles, then advance with a louder disclosure.
+            self._review_unread_streak += 1
+            persistent = self._review_unread_streak >= REVIEW_UNREAD_STREAK_LIMIT
+            self._append_cycle_receipt(
+                self._drive_root / "logs" / "events.jsonl",
+                {
+                    "ts": utc_now_iso(),
+                    "type": (
+                        "consciousness_review_unread_persistent" if persistent
+                        else "consciousness_review_unread"
+                    ),
+                    "due": len(ids),
+                    "streak": self._review_unread_streak,
+                    "reads": self._cycle_reads(),
+                    "detail": (
+                        "no memory body was read for "
+                        f"{self._review_unread_streak} consecutive cycle(s); "
+                        + (
+                            "advancing the cursor anyway so the same set is not "
+                            "re-injected forever (verify via the `engram` tool)"
+                            if persistent
+                            else "the due set will come due again next wake-up"
+                        )
+                    ),
+                },
+                label="review unread",
+            )
+            if not persistent:
+                return 0
+        else:
+            self._review_unread_streak = 0
+        marked = 0
+        try:
+            from ouroboros.agent import Env
+            from ouroboros.engram_read import client_for
+
+            # Resolve through the repo-anchored scope, not the drive's directory
+            # name: the drive is ``.../data`` and would otherwise file this
+            # system's memories under a second Engram project.
+            scope = Env(repo_dir=self._repo_dir, drive_root=self._drive_root)
+            client = client_for(scope)
+            for observation_id in ids:
+                result = client.mark_reviewed(observation_id)
+                if result.ok:
+                    marked += 1
+                else:
+                    log.debug(
+                        "consciousness: mark_reviewed failed for %s (%s)",
+                        observation_id,
+                        getattr(result, "error_kind", "unknown"),
+                    )
+        except Exception:
+            log.debug("Failed to advance Engram review cycle", exc_info=True)
+        if marked:
+            # This set is settled: the pushback budget is per due set, so a fresh
+            # set must get its own bounded grace rather than inheriting a spent one.
+            self._review_unread_streak = 0
+        return marked
 
     def _emit_progress(self, content: str) -> None:
         if not content or not content.strip():
@@ -984,9 +1206,132 @@ class BackgroundConsciousness:
         if persist_locally:
             append_jsonl(self._drive_root / "logs" / "progress.jsonl", entry)
 
+    @staticmethod
+    def _reset_retrieval_budget() -> None:
+        """A wake-up IS one retrieval turn: drop the previous cycle's accounting.
+
+        ``tools/engram.py`` keys the 3-read / 30,345-char budget on
+        ``(task_id, chat_id)``, and a background cycle pins ``task_id`` to
+        ``bg-consciousness`` for the whole process. Without this reset the cap is
+        spent once, and every later wake-up is then refused outright — the tool is
+        whitelisted precisely so a cycle CAN read a body.
+
+        Clearing is safe for the same reason C3 says so: it only LOOSENS a bound,
+        so it cannot drop or lose a memory. A concurrent in-process turn that also
+        loses its count merely gains headroom.
+        """
+        try:
+            from ouroboros.tools.engram import reset_turn_budgets
+
+            reset_turn_budgets()
+        except Exception:
+            log.debug("consciousness: retrieval budget reset failed", exc_info=True)
+
+    @staticmethod
+    def _begin_cycle_emit_budget() -> None:
+        """A wake-up IS one emit run: drop the previous cycle's per-run cap.
+
+        ``engram_sink`` caches its sink process-globally, and this loop never
+        passes through ``agent.py``'s task boundary (``handle_task`` ->
+        ``begin_engram_run``), so the C3 per-run cap decayed into "per process
+        lifetime" here: once one cycle's emissions had spent the 20, every later
+        wake-up's knowledge / narrative / verdict write was refused BEFORE the
+        spool — not even durable. Observed live 2026-09-12 19:34: three cycles in
+        9 s refused ``knowledge:infrastructure_gates`` while the store held no
+        such record, because the 19:16-19:19 burst had already spent the quota.
+
+        Same doctrine as ``_reset_retrieval_budget`` above (and as C3 itself):
+        clearing only LOOSENS a bound, so it cannot drop or lose a memory.
+        """
+        try:
+            from ouroboros.engram_sink import begin_engram_run
+
+            # None => EVERY sink for this process: the BG, the consolidator's
+            # knowledge context and any bare-drive caller share one drive.
+            begin_engram_run(None)
+        except Exception:
+            log.debug("consciousness: emit budget reset failed", exc_info=True)
+
+    def _degrade_context_for_size(
+        self,
+        messages: List[Dict[str, Any]],
+        observations: Sequence[Dict[str, Any]],
+        *,
+        provider: str,
+        effort: str,
+        tools: List[Dict[str, Any]],
+    ) -> bool:
+        """Re-render the system prompt as a task-local Low projection. True when it fits.
+
+        An over-sized prompt must not be a dead end. Grooming happens INSIDE a
+        cycle, so a wake-up that aborts before its first round can never shrink
+        the memory that overflowed it — the loop just re-aborts forever on the
+        same interval. Main chat already permits "confirmed overflow may retry
+        same model once with task-local Low without mutating the global"; the
+        same degradation here is what keeps the cycle recoverable.
+
+        The owner's global mode is never written: only this cycle's messages are
+        rebuilt, and the deviation is disclosed as its own event.
+        """
+        from ouroboros.openai_chat_dispatch import projected_context_size_bytes
+
+        before = str((messages[0] or {}).get("content") or "")
+        try:
+            compact = self._build_cycle_context(observations, context_mode="low")
+        except Exception:
+            log.warning("consciousness: task-local Low rebuild failed", exc_info=True)
+            return False
+        if not compact or len(compact) >= len(before):
+            return False
+        messages[0] = {**messages[0], "content": compact}
+        log.warning(
+            "consciousness: physical context over the ceiling — retried on the "
+            "task-local Low projection (%d -> %d chars)",
+            len(before), len(compact),
+        )
+        try:
+            projected_context_size_bytes(
+                messages, tools, provider=provider, reasoning_effort=effort
+            )
+        except Exception:
+            # The caller re-measures and decides; a failed estimate here cannot
+            # itself be an abort reason.
+            log.debug("consciousness: Low-projection size estimate failed", exc_info=True)
+        return True
+
+    @staticmethod
+    def _observation_recall_query(observations: Sequence[Dict[str, Any]]) -> str:
+        """The newest pending observation's payload, bounded, as a retrieval query.
+
+        Best-effort by construction: any shape surprise returns "" and the seam
+        falls back to its recency branch, exactly as before.
+        """
+        try:
+            for row in reversed(list(observations or ())):
+                if not isinstance(row, dict):
+                    continue
+                payload = row.get("payload")
+                if payload is None:
+                    # json.dumps(None) is the literal query "null" — a one-token
+                    # AND search that CAN match, which would fill the section with
+                    # unrelated hits instead of falling through to recency.
+                    continue
+                text = (
+                    payload
+                    if isinstance(payload, str)
+                    else json.dumps(payload, ensure_ascii=False)
+                )
+                text = " ".join(str(text or "").split())
+                if text:
+                    return text[:512]
+        except Exception:
+            log.debug("consciousness: observation recall query unavailable", exc_info=True)
+        return ""
+
     def _build_cycle_context(
         self,
         observations: Sequence[Dict[str, Any]],
+        context_mode: str = "",
     ) -> str:
         """Call context builders across the pre-observation compatibility seam.
 
@@ -1000,12 +1345,11 @@ class BackgroundConsciousness:
             parameters = inspect.signature(builder).parameters.values()
         except (TypeError, ValueError):
             parameters = ()
-        accepts_observations = any(
-            parameter.name == "observations"
-            or parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters
-        )
-        if accepts_observations:
+        kinds = {parameter.kind for parameter in parameters}
+        names = {parameter.name for parameter in parameters}
+        if "context_mode" in names or inspect.Parameter.VAR_KEYWORD in kinds:
+            return builder(observations=observations, context_mode=context_mode)
+        if "observations" in names or inspect.Parameter.VAR_KEYWORD in kinds:
             return builder(observations=observations)
         return builder()
 
@@ -1020,6 +1364,7 @@ class BackgroundConsciousness:
         self,
         *,
         observations: Optional[Sequence[Dict[str, Any]]] = None,
+        context_mode: str = "",
     ) -> str:
         from ouroboros.agent import Env
         env = Env(repo_dir=self._repo_dir, drive_root=self._drive_root)
@@ -1030,6 +1375,7 @@ class BackgroundConsciousness:
         self._identity_source_requirements = {}
         self._identity_source_reads = {}
         self._identity_unresolved_sources = set()
+        self._review_batch_ids = ()
 
         parts = [self._load_bg_prompt()]
 
@@ -1037,11 +1383,21 @@ class BackgroundConsciousness:
             logging.getLogger(__name__).warning(
                 "consciousness: docs/ARCHITECTURE.md not found or empty"
             )
-        parts.extend(build_governance_sections(env, warn_large=True, warn_label="consciousness"))
+        parts.extend(
+            build_governance_sections(
+                env, warn_large=True, warn_label="consciousness", context_mode=context_mode
+            )
+        )
 
         durable_dialogue_gaps: List[Dict[str, Any]] = []
         parts.extend(build_memory_sections(
-            memory, durable_dialogue_gaps_out=durable_dialogue_gaps,
+            memory,
+            durable_dialogue_gaps_out=durable_dialogue_gaps,
+            # A wake-up has no owner message to retrieve against, so the newest
+            # pending observation IS this cycle's question. Without it the recall
+            # seam always takes its no-query branch and answers "what happened
+            # lately" while the cycle has something specific to think about.
+            recall_query=self._observation_recall_query(observations),
         ))
         for gap in durable_dialogue_gaps:
             gap_id = str(gap.get("gap_id") or f"block-{gap.get('block_index', '?')}")
@@ -1097,17 +1453,66 @@ class BackgroundConsciousness:
                 pass
             log.debug("Failed to include improvement backlog in consciousness context", exc_info=True)
 
+        # Engram's own review cycle (C16 / AC14).  This is deliberately *not* a
+        # watermark the cycle maintains itself: Engram decides what is due via
+        # review_after, and `duplicate_count` / `last_seen_at` /
+        # `normalized_hash` / `topic_key` are what stop a record being consumed
+        # twice.  The local improvement backlog above is untouched — it is the
+        # *action queue* (KEPT-1), whereas this is the *memory* grooming input.
+        # Bounded to 8 records / 3000 chars, the same class of bound its local
+        # predecessor carried, so a wake-up can never become an unbounded pull.
+        from ouroboros.engram_client import EngramConfigError
+        from ouroboros.engram_read import client_for, due_for_review
+
+        try:
+            batch = due_for_review(client_for(env))
+            if batch.read.unknown:
+                parts.append(
+                    "## Engram review cycle\n\n"
+                    "(unavailable — what is due for review is UNKNOWN this cycle, "
+                    "not empty; do not read this as 'nothing to review')"
+                )
+            elif batch.read.status == "ok":
+                self._review_batch_ids = batch.ids
+                parts.append(
+                    f"## Engram review cycle ({batch.read.count} due)\n\n"
+                    f"{batch.read.text}\n\n"
+                    "(These are recalled memories due for review — verify, correct, "
+                    "merge or retract them by reading their bodies with the `engram` "
+                    "tool. A wake-up that reads none of them leaves them due for the "
+                    "next cycle; once at least one has been read, advancing the cycle "
+                    "is automatic.)"
+                )
+        except EngramConfigError:
+            # Configuration (the project scope) is mis-wired — same family as
+            # the recall/verdict seams: presence is UNKNOWN, not "nothing to
+            # review". Skipping silently would read as a clean backlog.
+            parts.append(
+                "## Engram review cycle\n\n"
+                "(the project scope could not be resolved — what is due for review "
+                "is UNKNOWN this cycle, not empty; do not read this as 'nothing "
+                "to review')"
+            )
+        except Exception:
+            log.debug("Failed to include Engram review cycle in consciousness context", exc_info=True)
+
         health_section = build_health_invariants(env)
         if health_section:
             parts.append(health_section)
 
-        # Full drive state: no clip_text here.
+        # The SAME bounded projection the main chat renders (`_drive_state_section`):
+        # the keys an agent reasons about, the rest NAMED, the full file one read away.
+        # This site injected the whole file — measured 211,112 chars / 33 top-level keys
+        # against a 1,200,000-char cap — and that unbounded section is what overflowed
+        # the background context. The warn below stays, but it now flags the FILE (which
+        # still costs a full read+parse per cycle), not the size of what we inject.
         state_json = safe_read(env.drive_path("state/state.json"), fallback="{}")
         if len(state_json) > BG_STATE_JSON_WARN_CHARS:
             log.warning(
-                "consciousness: drive state JSON is large (%d chars)", len(state_json)
+                "consciousness: drive state FILE is large (%d chars; the injected section "
+                "is the bounded projection)", len(state_json),
             )
-        parts.append("## Drive state\n\n" + state_json)
+        parts.append(_drive_state_section(env))
 
         scheduled_tasks_digest: Dict[str, Any] = {}
         parts.append(build_runtime_section(
@@ -1122,8 +1527,15 @@ class BackgroundConsciousness:
         parts.extend(build_recent_sections(
             memory, env, task_id="", chat_coverage_out=recent_chat_coverage,
         ))
+        # Policy: the lane's bounded tail read is the canonical reader for the
+        # chat source.  Its prefix omission is DISCLOSED via the coverage gap entry,
+        # not a completeness veto — the owner's ruling: identity may be updated from
+        # the bounded chat view.  Every other gap kind still blocks, fail-closed.
         if (
-            recent_chat_coverage.get("gaps")
+            any(
+                g.get("kind") != "generation_prefix_unscanned"
+                for g in (recent_chat_coverage.get("gaps") or ())
+            )
             or int(recent_chat_coverage.get("omitted_matching_rows") or 0) > 0
             or bool(recent_chat_coverage.get("omitted_matching_rows_unknown"))
         ):
@@ -1194,6 +1606,12 @@ class BackgroundConsciousness:
         "send_user_message", "update_scratchpad",
         "update_identity", "set_next_wakeup",
         "knowledge_read", "knowledge_write", "knowledge_list",
+        # The review-cycle section this class renders tells the cycle to
+        # "verify, correct, merge or retract" the due records, and the recall
+        # seam it also renders says a body is read with the `engram` tool. Both
+        # need a body read, so the tool must be reachable here: without it the
+        # cycle saw titles only and consumed records it could not inspect.
+        "engram",
         "web_search", "read_file", "list_files", "query_code",
         "chat_history", "recent_tasks",
         "initiate_presence",

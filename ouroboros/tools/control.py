@@ -2180,7 +2180,10 @@ def _update_scratchpad(ctx: ToolContext, content: str) -> str:
             "This likely means the tool call was malformed — check your arguments."
         )
     from ouroboros.memory import Memory
-    mem = Memory(drive_root=ctx.drive_root)
+    # Carry the repo root: without it ``sink_for`` falls back to the drive's own
+    # directory name and this block lands in a DIFFERENT Engram project than the
+    # identity mirror written by the same turn (F7 — one system, one project).
+    mem = Memory(drive_root=ctx.drive_root, repo_dir=getattr(ctx, "repo_dir", None) or ctx.drive_root)
     mem.ensure_files()
     try:
         block = mem.append_scratchpad_block(
@@ -2239,6 +2242,11 @@ def _send_user_message(ctx: ToolContext, text: str, reason: str = "") -> str:
     })
     if mode == "live":
         return "OK: message sent to owner chat."
+    if mode == "noted":
+        return (
+            "OK: the owner chat already carries a foreground answer to this message — "
+            "kept as a background note in the observation inbox, not sent as a second chat frame."
+        )
     return "OK: message queued for delivery."
 
 
@@ -2270,6 +2278,12 @@ def _update_identity(ctx: ToolContext, content: str) -> str:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+    # Identity stays LOCAL-ONLY by owner decision (S1 reversed): the fixed
+    # manifesto has no search scenario, and no code path needs to find it in
+    # Engram — so the mirror, its namespaced key, and the receipt bookkeeping are
+    # retired together. The local file is the single source of truth; journaling
+    # and provenance below are unchanged, and nothing here reaches the network.
 
     append_jsonl(mem.identity_journal_path(), {
         "ts": utc_now_iso(),

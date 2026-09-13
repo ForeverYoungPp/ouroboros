@@ -8,6 +8,18 @@ import pathlib
 import threading
 
 
+def _section_headings(context: str) -> list:
+    """The section headings an assembled prompt actually carries.
+
+    A heading is a LINE beginning with ``## `` — the same shape
+    ``tests/test_context_reading_side.py`` asserts over builder output. A substring
+    scan cannot do this job: governance documents legitimately NAME a removed
+    section in prose (``docs/ARCHITECTURE.md`` describes the removal in its own
+    words), and a mention must not read as an injected section.
+    """
+    return [line for line in context.splitlines() if line.startswith("## ")]
+
+
 def test_pattern_register_rewrite_receives_complete_tail(tmp_path, monkeypatch):
     from ouroboros import reflection
 
@@ -348,6 +360,17 @@ def _write_schedules(tmp_path, count):
     )
 
 
+def _write_chat(tmp_path, *, rows, text_bytes=8):
+    """One chat generation; ``text_bytes`` pushes it past the automatic scan tail."""
+    (tmp_path / "logs" / "chat.jsonl").write_text(
+        "".join(
+            json.dumps({"chat_id": idx + 1, "direction": "in", "text": "x" * text_bytes}) + "\n"
+            for idx in range(rows)
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_bgc_direct_identity_update_requires_complete_named_omission(tmp_path):
     bc = _bg_fixture(tmp_path)
     try:
@@ -492,6 +515,40 @@ def test_bgc_complete_recent_chat_keeps_direct_identity_update_available(tmp_pat
         bc._tool_executor.shutdown(wait=False, cancel_futures=True)
 
 
+def test_bgc_bounded_chat_prefix_no_longer_blocks_direct_identity_update(tmp_path):
+    bc = _bg_fixture(tmp_path, backlog_count=0)
+    try:
+        # Policy: the lane's bounded tail read is the canonical chat reader, so a
+        # prefix past `_AUTOMATIC_CHAT_TAIL_BYTES` is disclosed, not a veto.
+        _write_chat(tmp_path, rows=22, text_bytes=30_000)
+        bc._build_context()
+        assert "recent-chat" not in bc._identity_unresolved_sources
+        content = "I keep direct identity authority on the owner's bounded-chat policy."
+        result = bc._execute_tool(_tool_call("update_identity", {"content": content}, "u1"), [])
+        assert "IDENTITY_UPDATE_ABSTAINED" not in result
+        assert result.startswith("OK: identity updated")
+        assert content in (tmp_path / "memory" / "identity_journal.jsonl").read_text(encoding="utf-8")
+    finally:
+        bc._tool_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_bgc_row_count_gap_still_blocks_direct_identity_update(tmp_path):
+    bc = _bg_fixture(tmp_path, backlog_count=0)
+    try:
+        # The same oversized generation, but with rows past the scan bound: a
+        # row-count gap is not a bounded prefix, so it still blocks, fail-closed.
+        _write_chat(tmp_path, rows=6000, text_bytes=200)
+        bc._build_context()
+        assert "recent-chat" in bc._identity_unresolved_sources
+        content = "I must not rewrite identity while tail rows of the chat remain unscanned."
+        result = bc._execute_tool(_tool_call("update_identity", {"content": content}, "u1"), [])
+        assert "IDENTITY_UPDATE_ABSTAINED" in result
+        assert "recent-chat" in result
+        assert not (tmp_path / "memory" / "identity_journal.jsonl").exists()
+    finally:
+        bc._tool_executor.shutdown(wait=False, cancel_futures=True)
+
+
 def test_bgc_durable_dialogue_gap_blocks_direct_identity_update(tmp_path):
     bc = _bg_fixture(tmp_path, backlog_count=0)
     try:
@@ -503,7 +560,20 @@ def test_bgc_durable_dialogue_gap_blocks_direct_identity_update(tmp_path):
             "content": "[MEMORY GAP] A durable biography interval is unavailable.",
         }]), encoding="utf-8")
         context = bc._build_context()
-        assert "## Dialogue History" in context and "[MEMORY GAP]" in context
+        # The gap must remain VISIBLE to the background consciousness (BIBLE P1),
+        # but its old carrier — the lossy `## Dialogue History` narrative — left
+        # the prompt. The disclosure is rendered on its own now, bounded.
+        assert "[MEMORY GAP]" in context
+        assert "## Memory Gaps" in context
+        assert "dialogue-gap-123" in context
+        # Structural, not a substring scan: an injected section is a `## ` heading
+        # LINE, while governance prose that merely names the removed section
+        # (docs/ARCHITECTURE.md describes the removal in its own words) must not
+        # read as one. The positive control keeps the negative assertion from
+        # passing vacuously: this context really does carry heading lines.
+        headings = _section_headings(context)
+        assert any(h.startswith("## Memory Gaps") for h in headings)
+        assert not any(h.startswith("## Dialogue History") for h in headings)
         content = "I must not rewrite identity across a known durable biography gap."
         result = bc._execute_tool(_tool_call("update_identity", {"content": content}, "u1"), [])
         assert "IDENTITY_UPDATE_ABSTAINED" in result
@@ -646,5 +716,38 @@ def test_bgc_complete_observation_source_keeps_direct_identity_update_available(
         assert content in (tmp_path / "memory" / "identity_journal.jsonl").read_text(
             encoding="utf-8"
         )
+    finally:
+        bc._tool_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_bg_injects_the_bounded_drive_state_projection(tmp_path):
+    """BG used to inject state/state.json WHOLE; it now shares the main chat's projection.
+
+    Measured live at 211,112 chars / 33 top-level keys against a 1,200,000-char cap, the
+    raw blob was one of the two sections that overflowed the background context. The
+    bounded projection is the one `context._drive_state_section` already renders for the
+    main chat: the keys an agent reasons about, the rest NAMED, the full file one read
+    away (P1: the omission is disclosed, never silent).
+    """
+    bc = _bg_fixture(tmp_path, backlog_count=0)
+    try:
+        big = "z" * 300_000
+        (tmp_path / "state" / "state.json").write_text(json.dumps({
+            "session_id": "s-bg",
+            "current_branch": "dev/engram",
+            "huge_internal_cache": big,
+        }), encoding="utf-8")
+
+        context = bc._build_context()
+
+        assert "## Drive state" in context
+        assert '"session_id": "s-bg"' in context, "the projected key must be there"
+        assert big[:2_000] not in context, "the raw blob must NOT be injected"
+        assert "huge_internal_cache" in context, "an omitted key must still be NAMED"
+        assert "Omitted keys:" in context
+        assert "read_file(root='runtime_data', path='state/state.json')" in context
+
+        section = context.split("## Drive state", 1)[1].split("\n## ", 1)[0]
+        assert len(section) < 2_000, f"the injected section is {len(section)} chars"
     finally:
         bc._tool_executor.shutdown(wait=False, cancel_futures=True)
