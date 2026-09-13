@@ -2361,3 +2361,42 @@ def test_an_ordinary_recent_chat_render_is_byte_identical(tmp_path):
 
     entries, _ = memory.read_unconsolidated_chat(memory.load_dialogue_meta(), 1000)
     assert section == "## Recent chat\n\n" + memory.summarize_chat(entries, limit=1000)
+
+
+class TestBudgetDriftHonesty:
+    """`budget drift` used to render OK from an ABSENT measurement (owner report).
+
+    The writer suppresses the comparison deliberately — `supervisor/state.py:570-575`:
+    "a quarantined ledger tail makes the tracked side non-final; a confident percentage
+    would be dishonest. Comparison is suppressed, not zeroed." — and pairs
+    `budget_drift_pct=None` with `alert=False`. The render must not read that pairing as
+    health.
+    """
+
+    def _health(self, tmp_path, state):
+        env = _make_health_env(tmp_path)
+        (tmp_path / "state" / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        return build_health_invariants(env)
+
+    def test_a_suppressed_comparison_is_unknown_not_ok(self, tmp_path):
+        result = self._health(tmp_path, {
+            "spent_usd": 0, "budget_drift_pct": None, "budget_drift_alert": False,
+        })
+
+        assert "budget drift UNKNOWN" in result
+        assert "Absent is not within tolerance" in result
+        assert "OK: budget drift within tolerance" not in result
+
+    def test_a_missing_flag_is_also_unknown(self, tmp_path):
+        result = self._health(tmp_path, {"spent_usd": 0})
+
+        assert "budget drift UNKNOWN" in result
+        assert "OK: budget drift within tolerance" not in result
+
+    def test_a_measured_comparison_names_its_number(self, tmp_path):
+        result = self._health(tmp_path, {
+            "spent_usd": 0, "budget_drift_pct": 0.4, "budget_drift_alert": False,
+        })
+
+        assert "OK: budget drift within tolerance (0.4%)" in result
+        assert "UNKNOWN" not in result

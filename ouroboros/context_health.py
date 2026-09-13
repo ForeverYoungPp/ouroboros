@@ -299,10 +299,23 @@ def build_health_invariants(env: Any, task_id: str = "") -> str:
         from ouroboros.usage_accounting import usage_breakdown
 
         accounted = float(usage_breakdown(env.drive_root).get("accounted_usd") or 0.0)
+        drift_pct = state_data.get("budget_drift_pct")
         if state_data.get("budget_drift_alert"):
-            checks.append(f"WARNING: BUDGET DRIFT {state_data.get('budget_drift_pct', 0):.1f}% — tracked=${accounted:.2f} vs OpenRouter=${state_data.get('openrouter_total_usd', 0):.2f}")
+            pct = f"{float(drift_pct):.1f}%" if isinstance(drift_pct, (int, float)) else "unknown"
+            checks.append(f"WARNING: BUDGET DRIFT {pct} — tracked=${accounted:.2f} vs OpenRouter=${state_data.get('openrouter_total_usd', 0):.2f}")
+        elif drift_pct is None:
+            # ABSENT IS NOT HEALTHY. The writer suppresses the comparison deliberately
+            # (supervisor/state.py:570-575: a quarantined ledger tail makes the tracked side
+            # non-final, "a confident percentage would be dishonest"), and pairs
+            # `budget_drift_pct=None` with `alert=False`. Rendering that as "within
+            # tolerance" claims a measurement nobody took, so this row states its basis.
+            checks.append(
+                "INFO: budget drift UNKNOWN — no comparison was recorded this run (state "
+                "carries no `budget_drift_pct`; the writer suppresses it, e.g. on a "
+                "quarantined ledger tail). Absent is not within tolerance."
+            )
         else:
-            checks.append("OK: budget drift within tolerance")
+            checks.append(f"OK: budget drift within tolerance ({float(drift_pct):.1f}%)")
     except Exception:
         checks.append("WARNING: COST ACCOUNTING UNAVAILABLE — budget drift check skipped")
 
