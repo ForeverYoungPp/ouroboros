@@ -196,7 +196,7 @@ def append_cycle_outcome_checkpoint(
     append_jsonl(pathlib.Path(drive_root) / CHECKPOINTS_REL, entry)
 
 
-def _projected_cycle_outcome(info: Dict[str, Any]) -> str:
+def projected_cycle_outcome(info: Dict[str, Any]) -> str:
     """The outcome a cycle row SUPPORTS, for projection into the next cycle.
 
     Legacy rows were minted with a bare ``no_op`` from ONE fact — this agent's
@@ -205,6 +205,11 @@ def _projected_cycle_outcome(info: Dict[str, Any]) -> str:
     no-commit row still carrying that fallback is re-derived here from the same outcome axes
     the live mint now reads. (Precedent: the disclosure reads the path that decided —
     DEVELOPMENT.md, receipt identity.)
+
+    Public because BOTH consumers of a cycle row owe the reader the same word: this module's
+    capability digest AND the anti-repeat guard in ``post_task_evolution``, whose chooser
+    prompt is the one that DECIDES what to work on next. One of them re-deriving while the
+    other echoed the stored label left the unsupported claim steering objective selection.
     """
     stored = str(info.get("cycle_outcome") or "unknown")
     if stored != LEGACY_NO_OP_CYCLE_OUTCOME or info.get("commit_sha"):
@@ -278,7 +283,7 @@ def build_solve_capability_digest(drive_root: pathlib.Path, *, max_entries: int 
     failed: list[str] = []
     for task_id in reversed(order):  # newest first
         info = by_task.get(task_id) or {}
-        outcome = _projected_cycle_outcome(info)
+        outcome = projected_cycle_outcome(info)
         counts[outcome] = counts.get(outcome, 0) + 1
         objective = str(info.get("objective") or "").strip().replace("\n", " ")
         if len(objective) > 110:

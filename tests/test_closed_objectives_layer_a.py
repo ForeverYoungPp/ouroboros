@@ -7,11 +7,14 @@ from ouroboros.post_task_evolution import _DECISION_PROMPT, _closed_objectives_d
 def test_decision_prompt_has_closed_and_active_sections_and_formats():
     rendered = _DECISION_PROMPT.format(
         reflection="r", backlog="b", capability="c",
-        closed="- [NO_OP] X", active_objective="Y", force_note="",
+        closed="- [UNCOMMITTED] X", active_objective="Y", force_note="",
     )
     assert "[CLOSED / DROPPED" in rendered
     assert "[ACTIVE CAMPAIGN OBJECTIVE" in rendered
-    assert "- [NO_OP] X" in rendered and "Y" in rendered
+    assert "- [UNCOMMITTED] X" in rendered and "Y" in rendered
+    # The prompt's own steering must not name the retired label as a failure class: the tag
+    # below is derived now, so teaching `no_op` would re-introduce the claim the fix removed.
+    assert "no_op" not in rendered
     # the JSON example's escaped braces must survive .format()
     assert '"promote": true|false' in rendered
 
@@ -38,11 +41,26 @@ def test_closed_digest_from_structured_ledger(tmp_path):
          "campaign_objective": "Add CLI ref tool"},
     ])
     digest = _closed_objectives_digest(tmp_path)
-    assert "Add API key guard" in digest                 # no_op -> dropped
+    assert "Add API key guard" in digest                 # spent -> dropped
     assert "Modify the evolution machinery" in digest     # blocked_with_evidence (structural source)
     assert "Add CLI ref tool" in digest                   # absorbed = already shipped
     assert "[BLOCKED]" in digest
-    assert "[NO_OP]" in digest or "[ABANDONED]" in digest
+    # t1's row is a legacy bare `no_op` carrying no axes, so the tag is re-derived rather than
+    # echoed: the chooser is told what the record SUPPORTS (no reviewed commit), not that the
+    # cycle chose to do nothing.
+    assert "[UNCOMMITTED]" in digest
+
+
+def test_closed_digest_tag_is_derived_from_the_rows_own_axes(tmp_path):
+    """The chooser must not be told "it chose nothing" about a cycle that never ran."""
+    _write_ledger(tmp_path, [
+        {"task_id": "t1", "kind": "cycle_outcome", "cycle_outcome": "no_op",
+         "campaign_objective": "Autonomously improve Ouroboros",
+         "outcome_axes": {"execution": {"status": "infra_failed"}}},
+    ])
+    digest = _closed_objectives_digest(tmp_path)
+    assert "[INFRA_FAILED]" in digest
+    assert "[NO_OP]" not in digest
 
 
 def test_closed_digest_dedups_by_fingerprint(tmp_path):

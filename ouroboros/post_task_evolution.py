@@ -27,7 +27,7 @@ import os
 import pathlib
 from typing import Any, Dict, Optional
 
-from ouroboros.evolution_checkpoints import SPENT_CYCLE_OUTCOMES
+from ouroboros.evolution_checkpoints import SPENT_CYCLE_OUTCOMES, projected_cycle_outcome
 from ouroboros.evolution_fingerprint import _PLAN_REVIEW_SUFFIX
 
 log = logging.getLogger(__name__)
@@ -141,7 +141,7 @@ _DECISION_PROMPT = """You decide whether Ouroboros should run ONE reviewed self-
 Return ONLY a JSON object:
 {{"promote": true|false, "objective": "<one concrete, self-contained improvement to Ouroboros's own code/process; empty if not promoting>", "requires_plan_review": true|false, "backlog_id": "<id if this maps to a backlog item, else empty>"}}
 
-Rules: set promote=true ONLY when there is a concrete, high-value, self-contained code/process improvement worth a reviewed cycle right now. Prefer items already in the backlog, and weigh the solve-capability history: objective classes that historically got ABSORBED are better bets than classes that kept ending no_op/abandoned. Bias toward SMALL, TARGETED objectives that directly improve the ability to solve tasks (a sharper tool, a fixed failure mode, a removed bottleneck) over broad refactors or speculative platform work — small reviewed wins absorb; sprawling objectives historically die as no_op. Do NOT propose anything in the CLOSED / DROPPED list, or a restatement of the ACTIVE CAMPAIGN OBJECTIVE — those are already handled; if the only candidates are closed/active, return promote=false. If nothing is clearly worthwhile, return promote=false. {force_note}"""
+Rules: set promote=true ONLY when there is a concrete, high-value, self-contained code/process improvement worth a reviewed cycle right now. Prefer items already in the backlog, and weigh the solve-capability history: objective classes that historically got ABSORBED are better bets than classes that kept ending without landing a commit (interrupted, infra_failed, uncommitted — the tags below name which). Bias toward SMALL, TARGETED objectives that directly improve the ability to solve tasks (a sharper tool, a fixed failure mode, a removed bottleneck) over broad refactors or speculative platform work — small reviewed wins absorb; sprawling objectives historically fail to land. Do NOT propose anything in the CLOSED / DROPPED list, or a restatement of the ACTIVE CAMPAIGN OBJECTIVE — those are already handled; if the only candidates are closed/active, return promote=false. If nothing is clearly worthwhile, return promote=false. {force_note}"""
 
 
 def _closed_objectives_digest(drive_root: pathlib.Path) -> Optional[str]:
@@ -149,9 +149,10 @@ def _closed_objectives_digest(drive_root: pathlib.Path) -> Optional[str]:
 
     Built from the STRUCTURED ledger (state/evolution_checkpoints.jsonl), not patterns.md prose,
     so it cannot rot when prose formatting changes. An objective is closed when its latest cycle
-    outcome is absorbed (already shipped), abandoned/no_op (attempted and dropped), or the
-    objective/review axis recorded outcome_tier == "blocked_with_evidence" (hard-blocked).
-    Deduped by the SSOT fingerprint so the same base objective appears once. "" when nothing.
+    outcome is absorbed (already shipped), spent (attempted and dropped — the mint names WHY it
+    did not land), or the objective/review axis recorded outcome_tier == "blocked_with_evidence"
+    (hard-blocked). Deduped by the SSOT fingerprint so the same base objective appears once. ""
+    when nothing.
     """
     import json as _json
 
@@ -188,6 +189,11 @@ def _closed_objectives_digest(drive_root: pathlib.Path) -> Optional[str]:
             tx = row.get("transaction") if isinstance(row.get("transaction"), dict) else {}
             merged.setdefault("cycle_outcome", str(tx.get("cycle_outcome") or ""))
         axes = row.get("outcome_axes") if isinstance(row.get("outcome_axes"), dict) else {}
+        # Keep the axes: the row's own evidence is what the tag below re-derives from. Without
+        # them this digest could only echo the stored label, which is the defect the capability
+        # digest was fixed for — and this list is the one the CHOOSER reads.
+        if axes and not merged.get("axes"):
+            merged["axes"] = axes
         for axis in ("objective", "review"):
             axis_obj = axes.get(axis) if isinstance(axes.get(axis), dict) else {}
             if str(axis_obj.get("outcome_tier") or "") == "blocked_with_evidence":
@@ -208,7 +214,13 @@ def _closed_objectives_digest(drive_root: pathlib.Path) -> Optional[str]:
         if not fp or fp in seen:
             continue
         seen.add(fp)
-        tag = "BLOCKED" if blocked else (str(info.get("cycle_outcome") or "DROPPED").upper())
+        # The same projection the capability digest uses, never the stored word: a legacy row
+        # still carrying the bare ``no_op`` fallback says what its axes support. Echoing it here
+        # put the unsupported claim in front of the chooser that picks the NEXT objective.
+        stored_outcome = str(info.get("cycle_outcome") or "")
+        tag = "BLOCKED" if blocked else (
+            (projected_cycle_outcome(info) if stored_outcome else "DROPPED").upper()
+        )
         out.append(f"- [{tag}] {objective}")
     return "\n".join(out)
 
