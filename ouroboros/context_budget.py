@@ -204,7 +204,19 @@ IMAGE_BLOCK_CHAR_EQUIVALENT = 4_400
 MAX_LIVE_IMAGE_BLOCKS = 5
 
 # --- Scratchpad size thresholds (SSOT; previously scattered literals) -------
-# Context-section soft budget for the rendered scratchpad (warn-only).
+# The rendered scratchpad is a BOUNDED WINDOW, not a document: `_SCRATCHPAD_MAX_BLOCKS`
+# (memory.py, 10) caps how many blocks can exist at all, and the three numbers below are
+# an ESCALATION of late signals on top of that shape — not a size the section may grow
+# to. Measured on the live drive 2026-09-14: 10/10 blocks, 15,556 chars rendered.
+#
+#   consolidate (30,000)  the writer's own trigger: oldest blocks are compressed
+#   bloated     (50,000)  a health invariant saying "extract durable knowledge"
+#   section     (90,000)  this context builder's backstop — a WARNING, never a clip
+#
+# Passing the last one means both earlier signals were ignored; reaching it at all takes
+# blocks several times larger than any the live drive has written (its largest block is
+# ~2.5 KB). Nothing truncates at any of the three (BIBLE P1: a cognitive artifact is
+# never silently cut), which is exactly why the escalation has to be readable here.
 SCRATCHPAD_SECTION_BUDGET_CHARS = 90_000
 # Health-invariant bloat warning ("extract durable insights to knowledge").
 SCRATCHPAD_BLOAT_WARN_CHARS = 50_000

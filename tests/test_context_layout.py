@@ -174,3 +174,33 @@ def test_reference_doc_sections_decouple_arch_mode_from_dev_inclusion():
     low_no_dev = _render("low", False)
     assert "DEVBODY" not in low_no_dev
     assert "docs/DEVELOPMENT.md" in low_no_dev
+
+
+def test_the_bounded_members_of_tier0_declare_their_bounds():
+    """"Always resident in full" must not be read as "may grow without limit".
+
+    Three of the five protected members are WINDOWS, not documents: the scratchpad is
+    capped by a block count, the recent-dialogue horizon by a character budget, and the
+    knowledge index (a declared demotion, see above) by a titles-only projection. The
+    bounds live in constants and the escalation between them is a real ordering — a
+    change that inverts it would warn about size before the writer's own consolidation
+    could act. Pinned so the declaration cannot drift away from the enforcement.
+    """
+    from ouroboros.context import RECENT_CHAT_BUDGET_CHARS
+    from ouroboros.context_budget import (
+        SCRATCHPAD_BLOAT_WARN_CHARS,
+        SCRATCHPAD_CONSOLIDATION_THRESHOLD_CHARS,
+        SCRATCHPAD_SECTION_BUDGET_CHARS,
+    )
+    from ouroboros.memory import _SCRATCHPAD_MAX_BLOCKS
+
+    assert cl.TIER0_BOUNDED, "the bounded members are declared as data, not implied"
+    assert set(cl.TIER0_BOUNDED) <= set(cl.TIER0_ALWAYS_FULL)
+    assert _SCRATCHPAD_MAX_BLOCKS > 0
+    assert (
+        SCRATCHPAD_CONSOLIDATION_THRESHOLD_CHARS
+        < SCRATCHPAD_BLOAT_WARN_CHARS
+        < SCRATCHPAD_SECTION_BUDGET_CHARS
+    ), "consolidate -> warn -> backstop, in that order"
+    assert RECENT_CHAT_BUDGET_CHARS > 0
+    assert "scratchpad" in cl.TIER0_BOUNDED and "recent_dialogue" in cl.TIER0_BOUNDED

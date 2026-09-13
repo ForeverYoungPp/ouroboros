@@ -77,6 +77,17 @@ TIER0_ALWAYS_FULL = frozenset({
     "recent_dialogue",
 })
 
+#: Members of that core which are RENDERED EVERY TURN but are not unbounded documents:
+#: each is a WINDOW whose bound is a named constant, so "always resident in full" can
+#: never be read as "may grow without limit" — the reading that made the scratchpad look
+#: like a place to store things instead of a working window. Declared as data (not prose)
+#: so the drift guard in ``tests/test_context_layout.py`` can assert the bounds stay
+#: named and the members stay resident.
+TIER0_BOUNDED = {
+    "scratchpad": "memory._SCRATCHPAD_MAX_BLOCKS blocks (consolidated at 30,000 chars)",
+    "recent_dialogue": "context.RECENT_CHAT_BUDGET_CHARS, with a named omission note",
+}
+
 #: Sections that left the always-resident core and are satisfied by bounded
 #: on-demand retrieval instead. Kept as data so the replacement is auditable
 #: rather than an invisible deletion.

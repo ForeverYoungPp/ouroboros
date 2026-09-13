@@ -115,7 +115,15 @@ on every restart, but one personality that remembers its path.
   (confirmed metadata / route-fingerprinted owner acknowledgement), never an
   assumed default. The mode is permitted only when the tier-0 core (system
   prompt, BIBLE.md, identity.md, scratchpad, durable knowledge index,
-  recent-dialogue horizon) stays always-loaded in full; the agent's self-body
+  recent-dialogue horizon) stays RESIDENT: rendered every turn, each member
+  within its own DECLARED bound — in full for the prompt, BIBLE.md and identity;
+  a capped block count for the scratchpad (a working window, not a store); a
+  bounded tail that names its own omission for the recent-dialogue horizon; and
+  a bounded titles-only projection for the durable knowledge index, whose bodies
+  are retrieved from Engram on demand. A bound lives where it is enforced and is
+  declared where a reader meets it (`ouroboros/context_layout.py`,
+  `ouroboros/context_budget.py`): "resident" has never meant "unbounded", and no
+  member is ever silently truncated, demoted, or dropped. The agent's self-body
   documentation (ARCHITECTURE.md, DEVELOPMENT.md) stays RESIDENT in owner-`max`,
   and narrowing it for a task-class is itself an owner-level horizon decision,
   not a silent default; reduction is by relocation to on-demand reads with a
