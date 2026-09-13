@@ -206,6 +206,31 @@ def _mandatory_read_pointer(repo_dir: pathlib.Path, rel_path: str, section: str 
     )
 
 
+def _touched_files_by_retrieval(repo_dir: pathlib.Path) -> str:
+    """The touched-files section for a RETRIEVING delivery: a retrieval recipe
+    instead of an inlined pack (see ``evidence_by_retrieval``).
+
+    Measured 2026-09-13 (``build_touched_file_pack`` over the last six real
+    commits' file sets): the pack runs 938,483-1,147,342 chars with an EMPTY
+    omission list, because ``_FILE_SIZE_LIMIT`` bounds each FILE and nothing
+    bounds the TOTAL. That is this section's only honest use: the pack is
+    duplicable by retrieval, and the reviewer it fed already holds the tools to
+    duplicate it."""
+    return (
+        "## Touched files — retrieve them yourself (contents NOT inlined)\n\n"
+        "This review is delivered to a RETRIEVING reviewer, so the changed "
+        "files' full contents are deliberately not inlined here. Read them "
+        f"yourself from the repository root {repo_dir}:\n\n"
+        "- `vcs_diff` with staged=true shows the staged change, staged=false "
+        "the unstaged one.\n"
+        "- `read_file` reads a file's full content in bounded chunks "
+        "(start_line / max_lines).\n\n"
+        "Every path under \"Changed files\" above is relative to that root. The "
+        "staged diff below is the subject of this review; read the files it "
+        "turns on rather than all of them by reflex."
+    )
+
+
 def _build_advisory_prompt(
     repo_dir: pathlib.Path,
     commit_message: str,
@@ -215,6 +240,7 @@ def _build_advisory_prompt(
     drive_root: Optional[pathlib.Path] = None,
     prompt_context: Optional[dict] = None,
     governance_by_retrieval: bool = False,
+    evidence_by_retrieval: bool = False,
 ) -> str:
     """Build the read-only advisory prompt.
 
@@ -226,7 +252,18 @@ def _build_advisory_prompt(
     ``governance_by_retrieval=True`` is the agent_session delivery form: every
     other section is unchanged, but the governance BODIES are replaced by
     resolvable pointers (see below) so the pack stays compact enough for any
-    real route window."""
+    real route window.
+
+    ``evidence_by_retrieval=True`` applies the same form to the EVIDENCE: the
+    touched-file pack becomes a retrieval recipe. The pack is the full content
+    of every changed file and carries no TOTAL budget — one ordinary commit
+    measures ~940K-1.15M chars — so inlining it into a RETRIEVING delivery both
+    overran the inspection episode's transcript bound outright and, once that
+    bound was widened, spent its whole round budget re-reading content the
+    prompt already carried while ``role_requirements`` ordered exactly that
+    re-read. The STAGED DIFF stays inlined: it is the subject, it is bounded by
+    ``_MAX_DIFF_CHARS_ERROR``, and ``vcs_diff`` defaults to the UNSTAGED side —
+    inlining it removes a silent wrong-subject failure for ~30K chars."""
     prompt_context = dict(prompt_context or {})
     diff: Optional[str] = prompt_context.get("diff")
     changed_files: Optional[str] = prompt_context.get("changed_files")
@@ -289,10 +326,25 @@ def _build_advisory_prompt(
         preview = ", ".join(list(omitted_paths)[:5])
         if len(omitted_paths) > 5:
             preview += f", +{len(omitted_paths) - 5} more"
-        omitted_note = (
-            f"\n*(Inline pack contains omission notes for {len(omitted_paths)} path(s): {preview})*\n"
-        )
+        if evidence_by_retrieval:
+            omitted_note = (
+                f"\n*({len(omitted_paths)} changed path(s) have no printable body — "
+                f"sensitive, binary, oversized or unreadable: {preview}. Read them "
+                "yourself if the review needs them.)*\n"
+            )
+        else:
+            omitted_note = (
+                f"\n*(Inline pack contains omission notes for {len(omitted_paths)} path(s): {preview})*\n"
+            )
 
+    touched_section = (
+        _touched_files_by_retrieval(repo_dir)
+        if evidence_by_retrieval
+        else (
+            "## Current touched files (full content — read these with read_file "
+            "for deeper inspection)\n\n" + touched_pack
+        )
+    )
     critical_calibration = CRITICAL_FINDING_CALIBRATION  # noqa: F841 — used in f-string below
     skill_host_context = build_skill_host_context(repo_dir) if review_surface == "skill" else ""
     expected_items_section = ""
@@ -370,8 +422,7 @@ def _build_advisory_prompt(
         f"{arch_doc}\n\n{skill_host_context}\n\n{blocking_history}\n\n"
         f"## Commit message\n\n{commit_message}\n\n"
         f"## Changed files (git status --porcelain)\n\n{changed_files}\n\n"
-        "## Current touched files (full content — read these with read_file for deeper inspection)\n\n"
-        f"{touched_pack}\n{omitted_note}\n\n"
+        f"{touched_section}\n{omitted_note}\n\n"
         f"## Staged diff\n\n{diff}\n\n"
         f"## Step-by-step instructions\n{step_instructions}\n"
     )
@@ -1165,8 +1216,12 @@ def _run_claude_advisory(
             # Both deliveries RETRIEVE governance docs via mandatory-read
             # pointers (the session with its own tools, the native episode with
             # host inspection tools): the inlined multi-hundred-KB governance
-            # pack died with the Claude-SDK transport.
+            # pack died with the Claude-SDK transport. The EVIDENCE follows the
+            # same rule — the ~1M-char touched pack is the reviewer's to fetch
+            # (a run that inlines no repo diff, e.g. the skill payload surface,
+            # keeps the historical form).
             governance_by_retrieval=True,
+            evidence_by_retrieval=include_repo_diff,
         )
     except RuntimeError as exc:
         return [], f"⚠️ ADVISORY_ERROR: failed to build advisory prompt: {exc}", "", 0

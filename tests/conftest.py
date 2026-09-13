@@ -200,6 +200,13 @@ _SERIAL_TEST_FILES = frozenset({
     # under -n the replace-family no-side-effect pins (replace_env["calls"] == []) intermittently
     # observe git calls leaked by co-located modules. Same module-global class -> serial lane.
     "test_update_apply_routing.py",
+    # Spawns REAL threads through workers.handle_chat_ephemeral and drives
+    # process-global supervisor state (the event bus and the ephemeral lock).
+    # Under -n a co-located worker's supervisor teardown leaks in first and its
+    # get_event_q() raises "supervisor event bus is shutting down", which fails
+    # all four tests in the batch. Measured 2026-09-13: all four pass serially,
+    # and this file was the whole parallel-pass failure set in the commit gate.
+    "test_ephemeral_lock_hardening.py",
 })
 
 

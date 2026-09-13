@@ -345,3 +345,134 @@ def test_output_limit_rejection_is_not_reclassified(tmp_path, monkeypatch, api_e
         ctx.repo_dir, "msg", ctx, options={"include_repo_diff": False},
     )
     assert raw.startswith("⚠️ ADVISORY_ERROR"), raw
+
+
+# ---------------------------------------------------------------------------
+# 4. evidence by retrieval: the touched pack is not inlined
+#
+# Measured 2026-09-13 over the last six real commits' file sets: the touched
+# pack is the full content of every changed file and carries no TOTAL budget
+# (938,483-1,147,342 chars, empty omission list — _FILE_SIZE_LIMIT bounds each
+# FILE, nothing bounds the sum). Inlined, it made every advisory prompt
+# ~970K-1.2M chars: it overran the inspection episode's transcript bound
+# outright, and once that bound was widened the episode spent its whole round
+# budget re-reading content the prompt already carried while
+# role_requirements ordered exactly that re-read.
+# ---------------------------------------------------------------------------
+
+_PACK_SENTINEL = "TOUCHED-PACK-BODY-9K"
+
+
+def test_retrieval_delivery_drops_the_touched_pack(tmp_path):
+    """The retrieving form keeps the subject (diff + changed-file list) and the
+    retrieval recipe, and drops the pack body."""
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    _write_governance_docs(repo)
+    prompt = advisory._build_advisory_prompt(
+        repo, "commit msg",
+        prompt_context={
+            "diff": "DIFF-SENTINEL",
+            "changed_files": "M ouroboros/big_module.py",
+            "touched_pack": _PACK_SENTINEL,
+        },
+        governance_by_retrieval=True,
+        evidence_by_retrieval=True,
+    )
+    assert _PACK_SENTINEL not in prompt
+    # The subject survives: the diff is inlined (bounded by _MAX_DIFF_CHARS_ERROR,
+    # and vcs_diff defaults to the UNSTAGED side, so pointing at it could silently
+    # review the wrong subject) and the changed paths are still listed.
+    assert "DIFF-SENTINEL" in prompt
+    assert "M ouroboros/big_module.py" in prompt
+    # And the reviewer is told how to fetch what it needs.
+    assert "retrieve them yourself" in prompt
+    assert "staged=true" in prompt
+    assert str(repo) in prompt
+
+
+def test_legacy_delivery_still_inlines_the_touched_pack(tmp_path):
+    """Control: without the flag the historical inlining form is unchanged."""
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    _write_governance_docs(repo)
+    prompt = advisory._build_advisory_prompt(
+        repo, "commit msg",
+        prompt_context={"diff": "DIFF-SENTINEL", "changed_files": "M f.py",
+                        "touched_pack": _PACK_SENTINEL},
+        governance_by_retrieval=True,
+    )
+    assert _PACK_SENTINEL in prompt
+    assert "retrieve them yourself" not in prompt
+
+
+def test_retrieval_prompt_is_not_sized_by_the_changed_file(tmp_path):
+    """The class pinned structurally: the retrieving prompt is byte-identical
+    whatever the touched pack weighs, so no commit size can re-inflate it."""
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    _write_governance_docs(repo)
+    sizes = []
+    for pad in (200, 20_000):
+        prompt = advisory._build_advisory_prompt(
+            repo, "commit msg",
+            prompt_context={"diff": "DIFF-SENTINEL", "changed_files": "M f.py",
+                            "touched_pack": _PACK_SENTINEL * pad},
+            governance_by_retrieval=True,
+            evidence_by_retrieval=True,
+        )
+        sizes.append(len(prompt))
+    assert sizes[0] == sizes[1]
+
+
+def _dirty_repo(tmp_path):
+    """A real git repo with one modified file: a marker on line 1 that the diff
+    cannot reach (3 lines of context) and the change ~59 lines below it."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    for cmd in (["git", "init", "-q"],
+                ["git", "config", "user.email", "t@t"],
+                ["git", "config", "user.name", "t"]):
+        subprocess.run(cmd, cwd=repo, check=True, capture_output=True)
+    body = ["UNCHANGED-BODY-MARKER-8Z"] + [f"line_{i} = {i}" for i in range(60)]
+    (repo / "mod.py").write_text("\n".join(body) + "\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, check=True, capture_output=True)
+    body[-1] = "line_59 = 999"
+    (repo / "mod.py").write_text("\n".join(body) + "\n", encoding="utf-8")
+    return repo
+
+
+def test_native_route_dispatches_the_retrieval_form(tmp_path, monkeypatch, api_env):
+    """Wiring: a repo-diff advisory run hands the native episode the retrieval
+    form, not the ~1M-char pack. The flag is driven by include_repo_diff at the
+    one production call site, so this is the assertion that keeps it wired."""
+    _fake_window(monkeypatch, 1_000_000)
+    captured = {}
+
+    def _capture(prompt, repo_dir, ctx_, slot, model):
+        captured["prompt"] = prompt
+        return SimpleNamespace(
+            success=True, result_text=_ADVISORY_ITEMS, session_id="",
+            cost_usd=0.0, usage={}, error="", stderr_tail="",
+        ), model
+
+    monkeypatch.setattr(advisory, "_run_advisory_native", _capture)
+    repo = _dirty_repo(tmp_path)
+    ctx = _ctx(tmp_path)
+    ctx.repo_dir = repo
+    items, raw, _model, chars = advisory._run_claude_advisory(repo, "msg", ctx)
+
+    assert not raw.startswith("⚠️ ADVISORY_ERROR"), raw
+    assert [i["item"] for i in items] == ["correctness"]
+    prompt = captured["prompt"]
+    # The unchanged body of the changed file is NOT carried.
+    assert "UNCHANGED-BODY-MARKER-8Z" not in prompt
+    # The change itself IS: the diff is the subject.
+    assert "line_59 = 999" in prompt
+    assert "retrieve them yourself" in prompt
+    # And the prompt is a normal size, not a whole-file pack.
+    assert chars == len(prompt)
+    assert chars < 100_000, chars
