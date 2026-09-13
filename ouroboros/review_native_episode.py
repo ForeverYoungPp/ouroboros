@@ -9,9 +9,11 @@ seam (``review_execution._review_route_executor``).
 ONE episode is ONE logical review attempt: up to the configured round cap of
 ``LLMClient.chat(tools=…)`` calls against a fresh, instance-local
 inspection-only ``ToolRegistry``. Every provider call is its own ledger row;
-the caps fail closed (typed refusal, never mid-episode compaction or resume);
-the coordinator's second actor attempt repairs FORMAT locally, exactly like
-the session executor.
+the caps fail closed (typed refusal, never mid-episode compaction or resume),
+EXCEPT that the LAST permitted round withdraws the tools so the episode
+delivers the verdict it was paid for instead of returning nothing
+(``_FORCED_FINAL_NOTICE``); the coordinator's second actor attempt repairs
+FORMAT locally, exactly like the session executor.
 """
 
 from __future__ import annotations
@@ -101,12 +103,52 @@ _NATIVE_REVIEW_INSTRUCTIONS = (
 # unlike compaction, nothing unseen is summarized into the record.
 _EPISODE_TOOL_RESULT_CHAR_CAP = 120_000
 
+# The last permitted round is the DELIVERABLE round: the inspection tools are
+# withdrawn and this notice is appended, so an episode that spent its whole
+# budget inspecting still produces the verdict it was paid for.
+_FORCED_FINAL_NOTICE = (
+    "ROUND BUDGET EXHAUSTED: this is the final permitted round and the inspection "
+    "tools have been withdrawn. Answer NOW, in the output contract above, using "
+    "the evidence you have already collected. Do not describe what you would "
+    "inspect next; state your verdict on what you actually read."
+)
+
 # Physical-send headroom per provider call: llm.py may spend one internal
 # one-shot recovery send per chat() (param-drop/wire-recovery/reroute), and the
 # limit counts PHYSICAL sends. +2 keeps the final-answer round and the
 # coordinator's bookkeeping honest without unbounding anything.
 def native_episode_physical_send_cap() -> int:
     return 2 * review_native_max_rounds() + 2
+
+
+def _configured_output_budget(request: Any, slot: Any) -> int:
+    """The output budget the surface configured for this slot."""
+    return int(getattr(request, "max_tokens", 0) or 0) or int(
+        getattr(slot, "max_tokens", 0) or 0)
+
+
+def native_episode_answer_budget(request: Any, slot: Any) -> int:
+    """Output budget for the episode's DELIVERABLE turn.
+
+    Hidden reasoning shares the output budget with the answer on this wire — the
+    safety supervisor already paid for this lesson (``OUROBOROS_SAFETY_MAX_TOKENS``
+    exists because a reasoning light model burned the whole budget on hidden
+    reasoning and returned an empty body that fail-closed blocked a benign
+    command). Measured 2026-09-13 on a real advisory episode: the answer turn
+    consumed its ENTIRE 8,192-token budget on reasoning (completion_tokens ==
+    max_tokens, finish_reason='length', zero content) and the episode failed
+    closed with no verdict at all; at a 65,536-token budget the same episode
+    answered with 15,072 chars and finish_reason='stop'.
+
+    The INSPECTION rounds keep the configured budget — their output is tool-call
+    arguments. Only the deliverable turn is floored at the review surface's own
+    output budget (``tools/review._review_output_budget``, the SSOT that already
+    reads ``OUROBOROS_REVIEW_MAX_TOKENS``), so an operator who lowered that lever
+    keeps the behaviour they asked for."""
+    from ouroboros.tools.review import _review_output_budget
+
+    return max(_configured_output_budget(request, slot),
+               int(_review_output_budget() or 0))
 
 
 class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
@@ -119,6 +161,12 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
     actor attempt repairs FORMAT locally over the collected answer, exactly
     like the session executor — there is no mid-episode resume, transcript
     compaction, or per-round durable ledger, and the caps fail closed.
+
+    The LAST permitted round is the DELIVERABLE round: the inspection tools
+    are withdrawn there so an episode that spent its whole budget inspecting
+    still answers from the evidence it actually collected. The rail guarantees
+    the ATTEMPT, never a verdict — an empty deliverable keeps the same typed
+    refusal, and the model still decides what the answer says.
     """
 
     route = ReviewRouteKind.API_CHAT
@@ -259,6 +307,8 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
         deadline_at = str(getattr(request, "deadline_at", "") or "")
         rounds_cap = review_native_max_rounds()
         transcript_cap = review_native_max_transcript_chars()
+        configured_output_budget = _configured_output_budget(request, slot)
+        answer_budget = native_episode_answer_budget(request, slot)
         scratch = tempfile.mkdtemp(prefix="ouro-native-review-")
         registry = None
         total_usage: Dict[str, Any] = {}
@@ -299,17 +349,33 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
                         f"exceeded its bound ({transcript_cap}); the episode fails "
                         "closed — compaction would review a fabricated cut",
                         code="native_transcript_cap_exceeded")
+                forced_final = round_idx >= rounds_cap
                 chat_kwargs: Dict[str, Any] = {
                     "messages": messages,
                     "model": slot.model,
-                    "tools": schemas,
-                    "tool_choice": "auto",
                     "reasoning_effort": slot.effort,
-                    "max_tokens": int(request.max_tokens or slot.max_tokens),
+                    # The deliverable turn gets the review surface's output budget;
+                    # the inspection turns keep the configured one (their output is
+                    # tool-call arguments). See native_episode_answer_budget.
+                    "max_tokens": answer_budget if forced_final else configured_output_budget,
                     "no_proxy": bool(request.no_proxy),
                     "use_local": bool(slot.use_local),
                     "cache_affinity": f"{request.surface}:{request.task_id or 'review'}",
                 }
+                if forced_final:
+                    # The floor the host OWES: a verdict must exist. Without this
+                    # rail an episode that inspected to the cap returned nothing at
+                    # all, so every lane on this executor — triad, scope, advisory —
+                    # produced no verdict for a real inspection already paid for.
+                    # Measured 2026-09-13: the advisory episode spent 40/40 rounds
+                    # across 68 tool calls and still never answered. The host
+                    # guarantees the deliverable; the model still decides what it
+                    # says, and an empty deliverable still fails closed.
+                    messages.append({"role": "user", "content": _FORCED_FINAL_NOTICE})
+                    transcript_chars += len(_FORCED_FINAL_NOTICE)
+                else:
+                    chat_kwargs["tools"] = schemas
+                    chat_kwargs["tool_choice"] = "auto"
                 if request.temperature is not None or slot.temperature is not None:
                     chat_kwargs["temperature"] = (
                         request.temperature if request.temperature is not None
@@ -355,6 +421,13 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
                     len(json.dumps(tc, ensure_ascii=False, default=str))
                     for tc in tool_calls if isinstance(tc, dict)
                 )
+                if forced_final:
+                    # No tools were offered, so the content IS the episode's answer;
+                    # a malformed tool-call echo is not executable here. A genuinely
+                    # empty answer keeps the typed refusal it always was
+                    # (final_answer stays None -> native_rounds_exhausted).
+                    final_answer = content or None
+                    break
                 if content and not tool_calls:
                     final_answer = content
                     break

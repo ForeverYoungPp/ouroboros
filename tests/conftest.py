@@ -200,6 +200,14 @@ _SERIAL_TEST_FILES = frozenset({
     # under -n the replace-family no-side-effect pins (replace_env["calls"] == []) intermittently
     # observe git calls leaked by co-located modules. Same module-global class -> serial lane.
     "test_update_apply_routing.py",
+    # Spawns REAL threads through workers.handle_chat_ephemeral and drives
+    # process-global supervisor state (the event bus and the ephemeral lock).
+    # Under -n a co-located worker's supervisor teardown leaks in first and its
+    # get_event_q() raises "supervisor event bus is shutting down", which fails
+    # the whole co-located batch. Measured 2026-09-13: this file was the entire
+    # parallel-pass failure set of the commit gate, and all four of its tests
+    # pass serially.
+    "test_ephemeral_lock_hardening.py",
 })
 
 
@@ -398,9 +406,23 @@ def _rebind_runtime_roots_between_tests():
 
 @pytest.fixture(autouse=True)
 def _scrub_inherited_subagent_selection(monkeypatch):
-    """Keep tests independent of the operator's saved actor list and account pin."""
+    """Keep tests independent of the operator's saved actor list and account pin.
+
+    The operator's SAVED review panel is part of the same leak. The structured
+    reviewer SSOT names roster actors by ``subagent_id``, so scrubbing the roster
+    while leaving the rows that point at it produces
+    ``subagent_id ... does not resolve: subagent_configuration_unsaved`` in every
+    review-lane test — measured 2026-09-14 on a machine with a saved
+    roster-backed panel: 18 failures in tests/test_advisory_observability.py on a
+    clean tree. The rows and the roster they name must be scrubbed TOGETHER; a
+    test that wants a panel sets its own.
+    """
+    from ouroboros.reviewer_slot_config import REVIEWER_SLOTS_ENV
+
     monkeypatch.delenv("OUROBOROS_SUBAGENT_PROFILE", raising=False)
     monkeypatch.delenv("OUROBOROS_SUBAGENTS", raising=False)
+    monkeypatch.delenv(REVIEWER_SLOTS_ENV, raising=False)
+    monkeypatch.delenv("OUROBOROS_ADVISORY_REVIEW_ROUTE", raising=False)
 
 
 @pytest.fixture(autouse=True)
