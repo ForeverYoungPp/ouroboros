@@ -55,6 +55,15 @@ KNOWLEDGE_INDEX_TOPIC_CAP = 400
 #: recorded there, but that file does not carry the transport outcome.
 INDEX_STATUS_SEEDED = "seeded"
 
+#: Audit verdicts (``audit_index_topics``) — what a STORE READ found for a row that has
+#: no local file. Distinct from the transport outcomes above: ``present`` is not ``sent``
+#: (nobody recorded a send), it is "the store was asked and it holds this topic".
+INDEX_STATUS_PRESENT = "present"
+#: Neither a local file nor a store record within the store's READ BOUNDS. Named as the
+#: bounded fact it is: the read path's own doctrine is that a miss inside its bounds is
+#: not proof the record was never stored, so the row says where it looked.
+INDEX_STATUS_NOT_FOUND = "not_found"
+
 #: S2 stop switch. The CANONICAL ``memory/knowledge/<topic>.md`` + ``index-full.md``
 #: write is RETIRED: its readers (main chat, consciousness, deep self-review) now
 #: read Engram, so leaving the local write on would keep feeding a store nobody
@@ -211,7 +220,16 @@ def knowledge_index_rows(ctx: ToolContext) -> List[dict]:
 
 
 def knowledge_index_line(row: dict) -> str:
-    """One rendered index entry. Shared so the listing and the prompt cannot drift."""
+    """One rendered index entry. Shared so the listing and the prompt cannot drift.
+
+    A row that can name a topic nobody can read says so — and only a row whose absence was
+    VERIFIED may claim it. "No local file" is not evidence: 23 of the live drive's rows are
+    post-switch topics that live only in Engram, and `seeded` rows carry no transport
+    outcome at all, so a network-free render cannot tell a store-only topic from a dead
+    index row (three probe-residue rows sat in the prompt's index looking exactly like
+    readable topics until 2026-09-13). `audit_index_topics` establishes the fact once and
+    records it; this line only reports what it found.
+    """
     line = f"- {row.get('topic')} — updated {str(row.get('ts') or '')[:10]}"
     identity = str(row.get("identity") or "")
     if identity:
@@ -221,7 +239,59 @@ def knowledge_index_line(row: dict) -> str:
         line += " (queued, not yet in Engram)"
     elif status in ("refused", "failed", "capped", "no_receipt"):
         line += f" ({status or 'not in Engram'})"
+    elif status == INDEX_STATUS_NOT_FOUND:
+        line += (
+            " (no local file and nothing in the store's read bounds — this row may name "
+            "content that exists nowhere; verify with knowledge_read)"
+        )
     return line
+
+
+def audit_index_topics(ctx: ToolContext, *, limit: int = 200) -> dict:
+    """Verify every local-file-less index topic against the store, and RECORD the verdict.
+
+    The residue this closes: a ``seeded`` row is reconstructed from the provenance log,
+    which carries no transport outcome, so it can name a topic whose body exists nowhere —
+    and no network-free render can tell that apart from a post-switch topic that lives only
+    in Engram (23 of the live drive's 90 rows are the latter, every one verified present).
+    The distinguishing fact costs one store read per candidate, so it is established HERE,
+    once, and written back as a verdict row the renderer can print without touching the
+    network.
+
+    Only rows with no local body AND no recorded outcome are candidates: a receipt already
+    answers the question, and a local file is a body. Appends one row per candidate
+    (newest-per-topic wins, so a later write or audit supersedes it). Never raises: an
+    unreachable store records NOTHING and is counted ``unreadable`` — "could not read" must
+    never be written down as "absent" (C15). Returns counts by verdict.
+    """
+    counts = {"present": 0, "not_found": 0, "unreadable": 0}
+    try:
+        from ouroboros.engram_read import client_for, knowledge_topic
+
+        kdir = _knowledge_dir(ctx)
+        client = client_for(ctx)
+        scope = _engram_scope(ctx)
+        candidates = [
+            row
+            for row in _index_rows_for_dir(kdir)
+            if str(row.get("status") or "") in (INDEX_STATUS_SEEDED, "no_receipt")
+            and not (kdir / f"{str(row.get('topic') or '')}.md").exists()
+        ][:limit]
+        for row in candidates:
+            topic = str(row.get("topic") or "")
+            if not topic:
+                continue
+            read = knowledge_topic(client, topic, scope=scope)
+            if read.unknown:
+                counts["unreadable"] += 1
+                continue
+            verdict = INDEX_STATUS_PRESENT if read.status == "ok" else INDEX_STATUS_NOT_FOUND
+            _index_record(ctx, topic=topic, scope=scope, mode="audit_index", status=verdict)
+            counts[verdict] += 1
+    except Exception:
+        log.debug("knowledge index audit failed", exc_info=True)
+        counts["unreadable"] += 1
+    return counts
 
 
 #: Heading for the union's store half (see ``knowledge_index_union_body``). The archive

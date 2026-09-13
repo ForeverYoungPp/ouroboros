@@ -434,3 +434,72 @@ def test_the_listing_still_renders_local_files_the_store_does_not_know(tmp_path)
 
     assert "git-recipes" in listing
     assert "rebase" in listing, "summaries are still rendered for archive entries"
+
+
+# --------------------------------------------------------------------------- #
+# The residue class: a row whose body is nowhere is DISCLOSED, once verified
+# --------------------------------------------------------------------------- #
+
+
+def test_a_verified_absent_row_says_so_and_nothing_else_does(tmp_path, monkeypatch):
+    """The caveat is earned, not inferred.
+
+    "No local file" is the NORMAL shape for a post-switch topic (23 of the live drive's 90
+    rows are store-only, every one readable), so a render that inferred absence from it
+    would cry wolf on every prompt. Only the audit's recorded verdict may speak.
+    """
+    from ouroboros import engram_read
+    from ouroboros.engram_read import MachineRead
+    from ouroboros.tools.knowledge import audit_index_topics, knowledge_index_line
+
+    ctx = _Ctx(tmp_path / "drive")
+    _seed_history(
+        ctx,
+        _history_row("still-in-store", "2026-09-11T00:00:00+00:00")
+        + _history_row("gone-for-good", "2026-09-11T01:00:00+00:00"),
+    )
+
+    unverified = {r["topic"]: knowledge_index_line(r) for r in knowledge_index_rows(ctx)}
+    assert "exists nowhere" not in unverified["gone-for-good"], "unverified rows stay silent"
+
+    monkeypatch.setattr(engram_read, "client_for", lambda _ctx: object())
+    monkeypatch.setattr(
+        engram_read,
+        "knowledge_topic",
+        lambda _client, topic, scope="", **_kw: (
+            MachineRead(True, status="ok", count=1, text="a body")
+            if topic == "still-in-store"
+            else MachineRead(True, status="empty", count=0)
+        ),
+    )
+
+    assert audit_index_topics(ctx) == {"present": 1, "not_found": 1, "unreadable": 0}
+    lines = {r["topic"]: knowledge_index_line(r) for r in knowledge_index_rows(ctx)}
+    assert "exists nowhere" in lines["gone-for-good"], "the verified absence is disclosed"
+    assert "knowledge_read" in lines["gone-for-good"], "and the check is named"
+    assert "exists nowhere" not in lines["still-in-store"], "a readable topic gets no caveat"
+
+
+def test_an_unreadable_store_records_no_verdict(tmp_path, monkeypatch):
+    """'Could not read' must never be written down as 'absent' (C15)."""
+    from ouroboros import engram_read
+    from ouroboros.engram_read import MachineRead
+    from ouroboros.tools.knowledge import (
+        INDEX_STATUS_NOT_FOUND,
+        audit_index_topics,
+        knowledge_index_line,
+    )
+
+    ctx = _Ctx(tmp_path / "drive")
+    _seed_history(ctx, _history_row("unchecked", "2026-09-11T00:00:00+00:00"))
+    monkeypatch.setattr(engram_read, "client_for", lambda _ctx: object())
+    monkeypatch.setattr(
+        engram_read,
+        "knowledge_topic",
+        lambda *_a, **_kw: MachineRead(False, status="unavailable", detail="store down"),
+    )
+
+    assert audit_index_topics(ctx)["unreadable"] == 1
+    rows = {r["topic"]: r for r in knowledge_index_rows(ctx)}
+    assert rows["unchecked"]["status"] != INDEX_STATUS_NOT_FOUND, "no verdict was recorded"
+    assert "exists nowhere" not in knowledge_index_line(rows["unchecked"])
