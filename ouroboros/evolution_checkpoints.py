@@ -7,7 +7,12 @@ import pathlib
 import subprocess
 from typing import Any, Dict, Optional
 
-from ouroboros.outcomes import normalize_outcome_axes
+from ouroboros.outcomes import (
+    EXECUTION_CANCELLED,
+    EXECUTION_INFRA_FAILED,
+    EXECUTION_INTERRUPTED,
+    normalize_outcome_axes,
+)
 from ouroboros.utils import append_jsonl, utc_now_iso
 
 
@@ -15,6 +20,72 @@ CHECKPOINTS_REL = pathlib.Path("state") / "evolution_checkpoints.jsonl"
 
 #: The genuinely-pending outcome, recorded while a commit awaits its restart.
 PENDING_CYCLE_OUTCOME = "waiting_for_restart"
+
+#: The fallback outcome for a cycle that carries no reviewed commit. It names the fact the
+#: record actually proves — "no reviewed commit landed" — and deliberately not a conclusion
+#: about intent, which is why it replaced the bare ``no_op`` the mint used to write.
+UNCOMMITTED_CYCLE_OUTCOME = "uncommitted"
+#: No commit AND the axes prove the cycle never reached its own terms.
+INTERRUPTED_CYCLE_OUTCOME = "interrupted"
+INFRA_FAILED_CYCLE_OUTCOME = "infra_failed"
+#: The historical fallback, kept readable: rows already on disk still carry it, and a
+#: projection re-derives what they support instead of echoing the word.
+LEGACY_NO_OP_CYCLE_OUTCOME = "no_op"
+#: The owner stopped the campaign while this cycle was in flight.
+OWNER_STOPPED_CYCLE_OUTCOME = "owner_stopped"
+
+#: Every durable cycle-outcome name — the CLOSURE of the mint. A new value is added here
+#: first, and ``tests/test_cycle_outcome_truth.py`` pins the mint against this set by AST
+#: scan, so a name cannot be written without answering where it belongs.
+CYCLE_OUTCOME_VOCABULARY = frozenset({
+    "absorbed",
+    "abandoned",
+    OWNER_STOPPED_CYCLE_OUTCOME,
+    PENDING_CYCLE_OUTCOME,
+    LEGACY_NO_OP_CYCLE_OUTCOME,
+    UNCOMMITTED_CYCLE_OUTCOME,
+    INTERRUPTED_CYCLE_OUTCOME,
+    INFRA_FAILED_CYCLE_OUTCOME,
+})
+
+#: The subset meaning "this objective's attempt is SPENT — stop feeding it back as fresh
+#: work". A consumer that lists attempted objectives reads THIS, never a literal of its own:
+#: a literal is correct only until one side gains a value, at which point it silently skips
+#: the newcomer and drops its objective out of the anti-repeat guard entirely (which is
+#: exactly what ``post_task_evolution`` did with its own three-name set).
+#: Two vocabulary members are deliberately absent, each for its own reason:
+#: ``waiting_for_restart`` because an unverified commit leaves the transaction open, so that
+#: objective is neither spent nor re-proposable yet; and ``owner_stopped`` because the
+#: owner's stop is a verdict about the CAMPAIGN, not about the objective — widening the
+#: anti-repeat guard is not a side effect an honesty fix gets to have.
+SPENT_CYCLE_OUTCOMES = CYCLE_OUTCOME_VOCABULARY - {
+    PENDING_CYCLE_OUTCOME,
+    OWNER_STOPPED_CYCLE_OUTCOME,
+}
+
+
+def uncommitted_cycle_outcome(axes: Dict[str, Any] | None) -> str:
+    """Name WHY a cycle carries no reviewed commit, from the axes it already holds.
+
+    The mint used to derive this from one fact — the agent's ``commit_sha`` is empty — and
+    write ``no_op``: a claim about INTENT minted from evidence about AUTHORSHIP. On the live
+    ledger the twelve most recent cycles all read ``no_op`` while those same durable rows
+    carried ``execution=infra_failed`` (four of them, three inside 24 seconds),
+    ``execution=cancelled`` (the owner's own stop command) and ``objective=fail`` with a
+    ``blocked_with_evidence`` tier (measured work the commit gate refused). Not one of the
+    twelve had chosen to do nothing — and the word was fed back into the next cycle's own
+    objective as its record of itself.
+
+    So the value is derived from the strongest evidence present, and where the record cannot
+    tell "chose nothing" from "did everything it could and nothing landed", it says the thing
+    it CAN prove.
+    """
+    execution = str(((axes or {}).get("execution") or {}).get("status") or "").strip()
+    if execution in {EXECUTION_CANCELLED, EXECUTION_INTERRUPTED}:
+        return INTERRUPTED_CYCLE_OUTCOME
+    if execution == EXECUTION_INFRA_FAILED:
+        return INFRA_FAILED_CYCLE_OUTCOME
+    return UNCOMMITTED_CYCLE_OUTCOME
 
 
 def resolve_reported_cycle_outcome(transaction: Dict[str, Any] | None) -> str:
@@ -125,11 +196,27 @@ def append_cycle_outcome_checkpoint(
     append_jsonl(pathlib.Path(drive_root) / CHECKPOINTS_REL, entry)
 
 
+def _projected_cycle_outcome(info: Dict[str, Any]) -> str:
+    """The outcome a cycle row SUPPORTS, for projection into the next cycle.
+
+    Legacy rows were minted with a bare ``no_op`` from ONE fact — this agent's
+    ``commit_sha`` is empty — and that word asserts INTENT. A stored label is history and is
+    never rewritten; a PROJECTION must not repeat a claim the row cannot support, so a
+    no-commit row still carrying that fallback is re-derived here from the same outcome axes
+    the live mint now reads. (Precedent: the disclosure reads the path that decided —
+    DEVELOPMENT.md, receipt identity.)
+    """
+    stored = str(info.get("cycle_outcome") or "unknown")
+    if stored != LEGACY_NO_OP_CYCLE_OUTCOME or info.get("commit_sha"):
+        return stored
+    return uncommitted_cycle_outcome(info.get("axes") or {})
+
+
 def build_solve_capability_digest(drive_root: pathlib.Path, *, max_entries: int = 200) -> str:
     """Compact digest of which objectives actually improved the system.
 
     Joins task-done checkpoints with later ``cycle_outcome`` tags (last wins
-    per task) and renders absorbed vs abandoned/no_op history for the
+    per task) and renders absorbed vs every non-absorbed outcome for the
     promotion chooser. Returns "" when there is no usable history.
     """
     import json as _json
@@ -161,6 +248,9 @@ def build_solve_capability_digest(drive_root: pathlib.Path, *, max_entries: int 
         merged = by_task.setdefault(task_id, {})
         if task_id not in order:
             order.append(task_id)
+        _row_axes = row.get("outcome_axes") if isinstance(row.get("outcome_axes"), dict) else {}
+        if _row_axes and not merged.get("axes"):
+            merged["axes"] = _row_axes
         if str(row.get("kind") or "") == "cycle_outcome":
             merged["cycle_outcome"] = str(row.get("cycle_outcome") or merged.get("cycle_outcome") or "")
             merged["abandoned_reason"] = str(row.get("abandoned_reason") or merged.get("abandoned_reason") or "")
@@ -188,7 +278,7 @@ def build_solve_capability_digest(drive_root: pathlib.Path, *, max_entries: int 
     failed: list[str] = []
     for task_id in reversed(order):  # newest first
         info = by_task.get(task_id) or {}
-        outcome = str(info.get("cycle_outcome") or "unknown")
+        outcome = _projected_cycle_outcome(info)
         counts[outcome] = counts.get(outcome, 0) + 1
         objective = str(info.get("objective") or "").strip().replace("\n", " ")
         if len(objective) > 110:
@@ -207,7 +297,7 @@ def build_solve_capability_digest(drive_root: pathlib.Path, *, max_entries: int 
                 extras.append(f"cost=${info['cost_usd']:.2f}")
             suffix = f" ({', '.join(extras)})" if extras else ""
             absorbed.append(f"- ABSORBED: {objective or '(objective unknown)'}{suffix}")
-        elif outcome in {"abandoned", "no_op"} and len(failed) < 4:
+        elif outcome in SPENT_CYCLE_OUTCOMES and outcome != "absorbed" and len(failed) < 4:
             reason = str(info.get("abandoned_reason") or "").strip()
             suffix = f" — {reason}" if reason else ""
             failed.append(f"- {outcome.upper()}: {objective or '(objective unknown)'}{suffix}")

@@ -27,6 +27,7 @@ import os
 import pathlib
 from typing import Any, Dict, Optional
 
+from ouroboros.evolution_checkpoints import SPENT_CYCLE_OUTCOMES
 from ouroboros.evolution_fingerprint import _PLAN_REVIEW_SUFFIX
 
 log = logging.getLogger(__name__)
@@ -196,7 +197,9 @@ def _closed_objectives_digest(drive_root: pathlib.Path) -> Optional[str]:
     for task_id in reversed(order):  # newest first
         info = by_task.get(task_id) or {}
         blocked = bool(info.get("blocked"))
-        if str(info.get("cycle_outcome") or "") not in {"absorbed", "abandoned", "no_op"} and not blocked:
+        # The shared vocabulary, never a literal of its own: an outcome the mint can produce
+        # must not silently drop its objective out of this anti-repeat guard.
+        if str(info.get("cycle_outcome") or "") not in SPENT_CYCLE_OUTCOMES and not blocked:
             continue
         objective = str(info.get("objective") or "").strip().replace("\n", " ")
         if not objective:

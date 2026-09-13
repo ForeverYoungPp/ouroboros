@@ -15,6 +15,7 @@ import pathlib
 import uuid
 from typing import Any, Dict, Optional
 
+from ouroboros.evolution_checkpoints import uncommitted_cycle_outcome
 from ouroboros.evolution_fingerprint import canonical_objective_fingerprint
 from ouroboros.outcomes import normalize_outcome_axes
 from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
@@ -1123,7 +1124,10 @@ def update_evolution_campaign_after_task(
                 campaign.pop("post_task_backlog_id", None)
                 _bump_objective_repeat_count(campaign, tx)
             elif not has_commit:
-                tx["cycle_outcome"] = "no_op"
+                # Was a bare "no_op" derived from `not has_commit` alone: that is evidence
+                # about AUTHORSHIP, and the word asserts INTENT. The cycle's own axes are
+                # already in hand here, so the outcome names what the record can support.
+                tx["cycle_outcome"] = uncommitted_cycle_outcome(axes)
                 tx["restart_required"] = False
                 tx["recovery_hint"] = ""
                 tx["cleanup_status"] = "pending"

@@ -172,7 +172,10 @@ def test_evolution_task_completion_preserves_live_transaction_updates(tmp_path):
     campaign = queue.get_evolution_status_snapshot()["campaign"]
     assert "active_transaction" not in campaign
     assert campaign["transaction_history"][-1]["task_id"] == "task2"
-    assert campaign["transaction_history"][-1]["cycle_outcome"] == "no_op"
+    # The axes handed in above say the execution was infra_failed, so the outcome must say
+    # so: a bare "no_op" here claimed the cycle CHOSE to do nothing, which is a statement
+    # about intent that an empty commit_sha cannot support.
+    assert campaign["transaction_history"][-1]["cycle_outcome"] == "infra_failed"
 
 
 def test_terminal_evolution_event_without_running_metadata_updates_transaction(tmp_path):
@@ -220,7 +223,8 @@ def test_terminal_evolution_event_without_running_metadata_updates_transaction(t
     assert campaign["history"][0]["transaction"]["transaction_id"] == tx["transaction_id"]
     assert "active_transaction" not in campaign
     assert campaign["transaction_history"][-1]["task_id"] == "task-cancel"
-    assert campaign["transaction_history"][-1]["cycle_outcome"] == "no_op"
+    # result_status=cancelled: the cycle was stopped, it did not choose to do nothing.
+    assert campaign["transaction_history"][-1]["cycle_outcome"] == "interrupted"
     assert len(campaign["history"]) == 1
     assert campaign["cycles_done"] == 1
     assert int(supervisor_state.load_state().get("evolution_consecutive_failures") or 0) == 1
@@ -665,7 +669,9 @@ def test_solve_capability_digest_joins_taskdone_and_resolution_rows(tmp_path):
         transaction={"task_id": "evo1", "transaction_id": "tx1", "commit_sha": "abc123def456", "cycle_outcome": "absorbed"},
         source="boot_reconcile",
     )
-    # Cycle 2: honest no-op at task-done.
+    # Cycle 2: no reviewed commit. Its own axes say the execution was OK, which proves the
+    # cycle RAN but cannot prove it CHOSE to do nothing — and the row carries the legacy
+    # fallback, so the digest reports what the record supports instead of echoing the word.
     append_evolution_checkpoint(
         tmp_path, repo, task_id="evo2",
         campaign={"id": "c1", "objective": "Vague mega-refactor"},
@@ -674,10 +680,10 @@ def test_solve_capability_digest_joins_taskdone_and_resolution_rows(tmp_path):
     )
 
     digest = build_solve_capability_digest(tmp_path)
-    assert "absorbed=1" in digest and "no_op=1" in digest
+    assert "absorbed=1" in digest and "uncommitted=1" in digest
     assert "ABSORBED: Harden the review loop" in digest
     assert "abc123def4" in digest  # commit sha shortened
-    assert "NO_OP: Vague mega-refactor" in digest
+    assert "UNCOMMITTED: Vague mega-refactor" in digest
 
     # Long objectives carry an explicit truncation marker (no silent [:N]).
     append_evolution_checkpoint(
@@ -744,7 +750,7 @@ def test_no_op_cycle_resets_dirty_worktree_to_base_with_recovery_refs(tmp_path, 
     )
 
     recorded_tx = recorded["transaction"]
-    assert recorded_tx["cycle_outcome"] == "no_op"
+    assert recorded_tx["cycle_outcome"] == "uncommitted"
     assert recorded_tx["cleanup_status"] == "reset_to_base"
     assert recorded_tx["cleanup_stash"].startswith("evolution-cycle-cleanup-")
     assert recorded_tx["cleanup_preserved_ref"].startswith("evolution-leftover-")
