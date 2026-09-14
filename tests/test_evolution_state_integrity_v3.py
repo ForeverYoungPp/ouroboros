@@ -1799,11 +1799,8 @@ def test_restart_requires_the_exact_active_commit_receipt(tmp_path, monkeypatch)
         "task_id": tx["task_id"],
     }
     assert evolution_lifecycle.record_evolution_commit(**claim, commit_sha=sha)["ok"] is True
-    monkeypatch.setattr(
-        control,
-        "run_cmd",
-        lambda cmd, cwd=None: "" if cmd[:2] == ["git", "status"] else sha,
-    )
+    monkeypatch.setattr(control, "run_cmd_raw", lambda cmd, cwd=None: "")
+    monkeypatch.setattr(control, "run_cmd", lambda cmd, cwd=None: sha)
     ctx = SimpleNamespace(
         current_task_type="evolution",
         repo_dir=tmp_path,
@@ -1836,10 +1833,10 @@ def _restart_predicate_ctx(
     from ouroboros.tools import control
     from supervisor import evolution_lifecycle
 
-    monkeypatch.setattr(
-        control, "run_cmd",
-        lambda cmd, cwd=None: status if cmd[:2] == ["git", "status"] else head,
-    )
+    # Mirror the two helpers' real contracts: `run_cmd_raw` returns the UNTRIMMED
+    # porcelain text, `run_cmd` the trimmed rev-parse output.
+    monkeypatch.setattr(control, "run_cmd_raw", lambda cmd, cwd=None: status)
+    monkeypatch.setattr(control, "run_cmd", lambda cmd, cwd=None: head)
     monkeypatch.setattr(
         evolution_lifecycle, "check_evolution_authority",
         lambda *a, **k: {"ok": authority_ok, "reason": authority_reason},
@@ -1914,22 +1911,49 @@ def test_restart_reason_uses_the_live_path_of_a_rename(tmp_path, monkeypatch):
     assert "old/name.py" not in reason
 
 
-def test_restart_reason_keeps_the_first_path_intact(tmp_path, monkeypatch):
-    """The predicate must not strip porcelain output before parsing it. ` M path`
-    is the most common status code, and stripping eats that line's leading space,
-    so the first reported path loses a character and names a file that does not
-    exist — a fix that sends the agent to a phantom path."""
-    from ouroboros.tools import control
+def test_restart_reason_reads_a_real_porcelain_first_line(tmp_path, monkeypatch):
+    """The unfakeable pin: a REAL repo, a REAL unstaged change, the REAL runner.
 
-    sha = "f" * 40
-    raw = " M ouroboros/tools/control.py"
-    ctx = _restart_predicate_ctx(
-        tmp_path, monkeypatch, reviewed_sha=sha, head=sha, status=raw + "\n",
+    The previous version of this test stubbed `control.run_cmd`, so it asserted
+    against a string the production helper never returns — while `utils.run_cmd`
+    trims its stdout, which ate the first line's leading space and left the
+    refusal naming a file that does not exist. A stubbed collaborator cannot pin
+    a collaborator's contract.
+    """
+    from ouroboros.tools import control
+    from supervisor import evolution_lifecycle
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    (repo / "alpha.py").write_text("base\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+    (repo / "alpha.py").write_text("changed\n")  # ' M alpha.py' is now the FIRST line
+
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    monkeypatch.setattr(
+        evolution_lifecycle, "check_evolution_authority",
+        lambda *a, **k: {"ok": True, "reason": ""},
+    )
+    ctx = SimpleNamespace(
+        current_task_type="evolution",
+        repo_dir=repo,
+        task_id="evo-task",
+        task_metadata={"evolution_transaction": {}},
+        last_reviewed_commit_sha=head,
     )
 
     reason = control._evolution_restart_block_reason(ctx)
 
-    assert f"1 uncommitted path(s): {raw[3:]}" in reason
+    assert reason.startswith(
+        "the working tree still holds 1 uncommitted path(s): alpha.py"
+    )
 
 
 def test_restart_reason_names_both_shas_when_head_moved(tmp_path, monkeypatch):

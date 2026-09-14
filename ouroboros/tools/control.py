@@ -59,7 +59,7 @@ from ouroboros.subagent_runtime import (
 from ouroboros.tool_capabilities import ACTING_SUBAGENT_MODE, LOCAL_READONLY_SUBAGENT_MODE
 from ouroboros.tool_policy import swarm_router_turn
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.utils import append_jsonl, atomic_write_json, truncate_review_artifact, utc_now_iso, run_cmd
+from ouroboros.utils import append_jsonl, atomic_write_json, truncate_review_artifact, utc_now_iso, run_cmd, run_cmd_raw
 
 log = logging.getLogger(__name__)
 
@@ -718,10 +718,11 @@ _RESTART_DIRTY_PATHS_SHOWN = 12
 
 
 def _uncommitted_path_summary(status: str) -> str:
-    """Bounded, honestly-counted live paths from RAW `git status --porcelain` output.
+    """Bounded, honestly-counted live paths from UNTRIMMED `git status --porcelain`.
 
-    Deliberately unstripped: porcelain v1 is `XY <path>`, so the path starts at
-    index 3 and a stripped string silently corrupts the first line.
+    Callers must pass `run_cmd_raw` output, never `run_cmd`: porcelain v1 is
+    `XY <path>`, so the path starts at index 3 and a trimmed string corrupts its
+    first line.
     """
     paths: List[str] = []
     for line in status.splitlines():
@@ -762,11 +763,12 @@ def _evolution_restart_block_reason(ctx: ToolContext) -> str:
     if str(ctx.current_task_type or "") != "evolution":
         return ""
     try:
-        # NOT stripped: `git status --porcelain` puts the path at index 3, so
-        # stripping eats the leading space of the FIRST line whenever it is an
-        # unstaged modification (` M path`) — the most common status code — which
-        # drops that path's first character and names a path that does not exist.
-        status = run_cmd(["git", "status", "--porcelain"], cwd=ctx.repo_dir)
+        # UNTRIMMED on purpose: porcelain v1 is `XY <path>`, so the path starts at
+        # index 3, and the shared `run_cmd`'s `.strip()` eats the leading space of
+        # the FIRST line whenever it is an unstaged change (` M path`) — the most
+        # common status code — dropping that path's first character and naming a
+        # file that does not exist. `run_cmd_raw` is the same runner, untrimmed.
+        status = run_cmd_raw(["git", "status", "--porcelain"], cwd=ctx.repo_dir)
         head = run_cmd(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir).strip()
     except Exception as exc:
         return f"could not verify local git durability: {exc}"

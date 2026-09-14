@@ -892,7 +892,7 @@ def extract_trailing_json_object(
     return prefix, parsed, duplicate_flagged
 
 
-def run_cmd(cmd: List[str], cwd: Optional[pathlib.Path] = None) -> str:
+def _run_checked(cmd: List[str], cwd: Optional[pathlib.Path] = None) -> str:
     # Tool output is PARSED (git error signatures, porcelain text), so it must not
     # depend on the operator's locale: a Russian-locale git answers «метка … уже
     # существует» where the code and its tests match "already exists".
@@ -904,7 +904,24 @@ def run_cmd(cmd: List[str], cwd: Optional[pathlib.Path] = None) -> str:
         raise RuntimeError(
             f"Command failed: {' '.join(cmd)}\n\nSTDOUT:\n{res.stdout}\n\nSTDERR:\n{res.stderr}"
         )
-    return res.stdout.strip()
+    return res.stdout
+
+
+def run_cmd(cmd: List[str], cwd: Optional[pathlib.Path] = None) -> str:
+    """Run a command and return its stdout with surrounding whitespace trimmed."""
+    return _run_checked(cmd, cwd).strip()
+
+
+def run_cmd_raw(cmd: List[str], cwd: Optional[pathlib.Path] = None) -> str:
+    """Same runner as `run_cmd`, WITHOUT trimming the output.
+
+    Required for structured output whose leading whitespace is DATA. `git status
+    --porcelain` is `XY <path>`, so the path starts at index 3: trimming eats the
+    leading space of the first line whenever it is an unstaged change
+    (` M path`), which drops that path's first character and lets a caller name a
+    file that does not exist.
+    """
+    return _run_checked(cmd, cwd)
 
 def get_git_info(repo_dir: pathlib.Path) -> tuple[str, str]:
     """Best-effort retrieval of (git_branch, git_sha)."""
