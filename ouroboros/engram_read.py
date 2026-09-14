@@ -152,8 +152,22 @@ def _read_failure(result: Any) -> MachineRead:
     )
 
 
-def recent(client: Any, *, limit: int = MAX_WINDOW) -> MachineRead:
-    """Bounded read of the newest records. Returns counts and a version token."""
+def recent(
+    client: Any,
+    *,
+    limit: int = MAX_WINDOW,
+    render_limit: int = MAX_DIGEST_ITEMS,
+) -> MachineRead:
+    """Bounded read of the newest records. Returns counts and a version token.
+
+    ``limit`` bounds the FETCH; ``render_limit`` bounds how many of those records
+    become lines. They are separate because the two callers want different things: a
+    caller that scans the fetched window (``type_digest``, ``knowledge_topic``) must not
+    render all of it, while the per-turn recall seam owns its own title cap
+    (``context.MAX_RECALL_ITEMS``) and declares it per call. Measured 2026-09-14: the old
+    single bound rendered ``items[:MAX_DIGEST_ITEMS]`` — 8 lines — so the recency leg
+    silently capped a seam that had just been raised to 15.
+    """
     bounded = max(1, min(int(limit or MAX_WINDOW), MAX_COUNT_LIMIT))
     result = client.recent(limit=bounded)
     if not result.ok:
@@ -168,7 +182,7 @@ def recent(client: Any, *, limit: int = MAX_WINDOW) -> MachineRead:
         status="ok",
         count=len(items),
         version=_version_token(project, len(items), latest),
-        text="\n".join(_line(item) for item in items[:MAX_DIGEST_ITEMS]),
+        text="\n".join(_line(item) for item in items[: max(1, min(int(render_limit or MAX_DIGEST_ITEMS), len(items)))]),
     )
 
 
@@ -224,7 +238,12 @@ def digest(
     times the traffic for the same answer. A caller that wants only a few lines
     passes the few it wants.
     """
-    read = recent(client, limit=_bounded_items(window, MAX_COUNT_LIMIT))
+    read = recent(
+        client,
+        limit=_bounded_items(window, MAX_COUNT_LIMIT),
+        # The digest renders what ITS caller asked to see, capped by the module bound.
+        render_limit=_bounded_items(limit, MAX_WINDOW),
+    )
     if not read.ok:
         return read
     if read.status == "empty":
@@ -413,8 +432,15 @@ def search_titles(
     limit: int = MAX_DIGEST_ITEMS,
     max_chars: int = MAX_DIGEST_CHARS,
     match_mode: str = "",
+    ceiling: int = MAX_DIGEST_ITEMS,
 ) -> MachineRead:
     """Layer-1 keyword recall: ONE title line per hit, never a body.
+
+    ``ceiling`` is the caller's own declared maximum for ITS list. ``MAX_DIGEST_ITEMS``
+    mirrors another module's default (``improvement_backlog.format_backlog_digest``), so
+    it must not be raised for every caller because one seam wants a longer list: the
+    per-turn recall lists TITLES, which are bounded by bytes, and declares its own cap
+    (``context.MAX_RECALL_ITEMS``). A caller that passes nothing keeps the old ceiling.
 
     ``match_mode="any"`` is what makes a natural-language query usable as a
     retrieval question: under Engram's default (AND) a sentence only matches a
@@ -431,7 +457,7 @@ def search_titles(
     text = str(query or "").strip()
     if not text:
         return MachineRead(True, status="empty", count=0, detail="empty query")
-    wanted = _bounded_items(limit, MAX_DIGEST_ITEMS)
+    wanted = _bounded_items(limit, ceiling)
     result = client.search(
         text, limit=wanted, type=type_name or "", match_mode=match_mode or ""
     )

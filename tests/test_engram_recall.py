@@ -743,3 +743,43 @@ def test_each_recall_leg_stays_inside_its_own_budget(engram_stub):
     # The dialogue halves keep their own 2,000-char budget; the total is the sum.
     assert len(section) <= DIALOGUE_RECALL_BUDGET_CHARS + KNOWLEDGE_RECALL_BUDGET_CHARS + 400
     reset_sinks()
+
+def test_the_title_list_is_sized_for_fifteen_items(engram_stub):
+    """Titles are cheap, so the OWNER raised this seam 5 -> 15 — and the raise is only
+    real if 15 lines FIT the byte budget, in the two-half shape as well as the single
+    list. Measured live: a dialogue title line is ~80 chars, a knowledge one ~56.
+
+    A seam that returned bodies would not have been raised (bodies cost what the budget
+    exists to cap): this pin keeps the two numbers in step.
+    """
+    from ouroboros.context import (
+        _RECALL_HALF_BUDGET_CHARS,
+        KNOWLEDGE_RECALL_BUDGET_CHARS,
+        MAX_KNOWLEDGE_RECALL_ITEMS,
+        MAX_RECALL_ITEMS,
+    )
+    from ouroboros.engram_read import MAX_DIGEST_ITEMS
+
+    assert MAX_RECALL_ITEMS == 15 and MAX_KNOWLEDGE_RECALL_ITEMS == 15
+    measured = {"dialogue_summary": 80, "knowledge": 56}
+    assert 15 * measured["dialogue_summary"] + 90 <= DIALOGUE_RECALL_BUDGET_CHARS
+    assert 15 * measured["dialogue_summary"] <= _RECALL_HALF_BUDGET_CHARS, "one half"
+    assert 15 * measured["knowledge"] <= KNOWLEDGE_RECALL_BUDGET_CHARS
+    assert MAX_RECALL_ITEMS > MAX_DIGEST_ITEMS, "the seam declares its own ceiling"
+
+
+def test_fifteen_blocks_render_when_the_store_holds_them(engram_stub):
+    """The behavioural half of the raise: the item cap, not the byte budget, was 5."""
+    from ouroboros.engram_cache import reset_cache
+
+    state, env = engram_stub
+    reset_cache()
+    _seed(state, [_block(f"2026-09-{i:02d} span", f"span {i}") for i in range(1, 16)])
+    state.search_returns_content = False  # force the recency read: the widest list
+    memory = Memory(env.drive_root, env.repo_dir)
+
+    section = _engram_recall_section(memory, "")
+
+    titles = [line for line in section.splitlines() if line.startswith("- [")]
+    assert len(titles) == 15, f"expected the raised cap, got {len(titles)}"
+    reset_sinks()

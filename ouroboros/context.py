@@ -988,20 +988,30 @@ def build_governance_sections(
     return sections
 
 
-#: How many remembered dialogue blocks one turn may surface.
-MAX_RECALL_ITEMS = 5
+#: How many remembered dialogue blocks one turn may surface. Raised 5 -> 15 on the
+#: owner's rule for this seam: the seam returns TITLES, so more of them is cheap — and
+#: the byte budget below, not this number, is the real bound (a title line measures ~80
+#: chars on the live store, so 15 of them fit inside it with room to spare). A seam that
+#: returned bodies would not have been raised.
+MAX_RECALL_ITEMS = 15
 #: Largest rendered recall section. The section it replaces had NO budget and
 #: reached 30,344 chars; a replacement without a bound would repeat that.
-DIALOGUE_RECALL_BUDGET_CHARS = 2_000
+#: Sized for the two-half shape rather than for one list: the halves each get
+#: ``_RECALL_HALF_BUDGET_CHARS`` of it, so 15 measured title lines (~1,200 chars) plus
+#: the two sub-headings must fit in ONE half, which 2,600 does with 1,255 per half.
+DIALOGUE_RECALL_BUDGET_CHARS = 2_600
 #: The knowledge leg's OWN budget, ADDED to the recall total (it does not split the
 #: dialogue halves): at most MAX_KNOWLEDGE_RECALL_ITEMS titles, ~120 chars each plus
 #: its heading, so 1,000 leaves headroom. The section can now cost up to
 #: DIALOGUE_RECALL_BUDGET_CHARS + this, which is still far under the knowledge index
 #: (6,569 chars) the seam replaced.
 KNOWLEDGE_RECALL_BUDGET_CHARS = 1_000
-#: Item cap for the knowledge leg — below MAX_RECALL_ITEMS on purpose: it is a
-#: pointer list beside the dialogue halves, not a second result page.
-MAX_KNOWLEDGE_RECALL_ITEMS = 5
+#: Item cap for the knowledge leg. It sits beside the dialogue halves rather than
+#: splitting their budget, so it is bounded by its own bytes — which is what makes the
+#: same 15 safe here. Its job is RELEVANCE ORDER on one query: the resident
+#: `## Knowledge index` already enumerates topics (recency order, budgeted), so this leg
+#: earns its bytes by ranking them against the question, never by listing more.
+MAX_KNOWLEDGE_RECALL_ITEMS = 15
 #: When a section carries BOTH halves (query hits + newest summaries), each half
 #: gets this much of the budget, minus the two sub-headings that separate them.
 #: Split rather than shared, so a long hit list cannot squeeze the continuity
@@ -1170,6 +1180,9 @@ def _engram_recall_section(memory: Memory, query: str = "") -> str:
                 text,
                 type_name="dialogue_summary",
                 limit=MAX_RECALL_ITEMS,
+                # This seam declares its OWN ceiling: the shared MAX_DIGEST_ITEMS mirrors
+                # another module's default and is not what bounds a title list.
+                ceiling=MAX_RECALL_ITEMS,
                 max_chars=(
                     _RECALL_HALF_BUDGET_CHARS if carry_newest
                     else DIALOGUE_RECALL_BUDGET_CHARS
@@ -1202,6 +1215,7 @@ def _engram_recall_section(memory: Memory, query: str = "") -> str:
                 text,
                 type_name="knowledge",
                 limit=MAX_KNOWLEDGE_RECALL_ITEMS,
+                ceiling=MAX_KNOWLEDGE_RECALL_ITEMS,
                 max_chars=KNOWLEDGE_RECALL_BUDGET_CHARS,
                 match_mode="any",
             )
