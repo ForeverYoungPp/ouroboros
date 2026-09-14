@@ -2489,12 +2489,31 @@ def _perform_supervisor_restart(
         except Exception:
             head = ""
             clean = False
-        if not expected_sha or head != expected_sha or not clean:
+        # Name the fact that actually failed. These three conditions were
+        # collapsed into one message ("the live checkout no longer matches the
+        # exact reviewed evolution commit"), which is false for the dirty case:
+        # the checkout DOES match there, and the owner was told to look for a
+        # mismatch that does not exist.
+        if not expected_sha:
+            mismatch = "the restart receipt recorded no expected commit"
+        elif head != expected_sha:
+            mismatch = (
+                f"the live checkout is at {head[:12] or 'an unreadable HEAD'}, "
+                f"not the reviewed {expected_sha[:12]}"
+            )
+        elif not clean:
+            mismatch = (
+                "the live checkout is at the reviewed commit, but the working tree "
+                "is not provably clean and rescue_and_block refuses to boot over "
+                "local changes"
+            )
+        else:
+            mismatch = ""
+        if mismatch:
             if st.get("owner_chat_id"):
                 ctx.send_with_budget(
                     int(st["owner_chat_id"]),
-                    "🧬 Restart cancelled: the live checkout no longer matches "
-                    "the exact reviewed evolution commit.",
+                    f"🧬 Restart cancelled: {mismatch}.",
                 )
             return
     ok, msg = _safe_restart_serialized(

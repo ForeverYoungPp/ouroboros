@@ -712,16 +712,81 @@ def _emit_and_wait_for_routing(
     ))
 
 
+# How many live paths a refusal names before it discloses the remainder: the
+# message must be actionable without becoming a wall of porcelain output.
+_RESTART_DIRTY_PATHS_SHOWN = 12
+
+
+def _uncommitted_path_summary(status: str) -> str:
+    """Bounded, honestly-counted live paths from RAW `git status --porcelain` output.
+
+    Deliberately unstripped: porcelain v1 is `XY <path>`, so the path starts at
+    index 3 and a stripped string silently corrupts the first line.
+    """
+    paths: List[str] = []
+    for line in status.splitlines():
+        entry = line.rstrip()
+        if not entry:
+            continue
+        raw = entry[3:] if len(entry) > 3 else entry.strip()
+        if " -> " in raw:  # rename/copy: the live path is the destination
+            raw = raw.rsplit(" -> ", 1)[1]
+        path = raw.strip()
+        if path:
+            paths.append(path)
+    if not paths:
+        return "uncommitted changes in an unparsable working-tree state"
+    shown = paths[:_RESTART_DIRTY_PATHS_SHOWN]
+    omitted = len(paths) - len(shown)
+    summary = f"{len(paths)} uncommitted path(s): " + ", ".join(shown)
+    return summary + (f" (+{omitted} more)" if omitted > 0 else "")
+
+
 def _evolution_restart_block_reason(ctx: ToolContext) -> str:
+    """Why THIS evolution task may not restart yet — one truthful clause per fact.
+
+    Every clause is derived from the condition it describes, and ALL failing
+    conditions are reported: a refusal that names one cause while holding
+    another sends the agent to repair the wrong thing (cycle #41 was answered
+    "commit_reviewed must create a local reviewed commit" while the receipt
+    existed and matched HEAD — the real blocker was an orphaned payload's
+    uncommitted paths, which that text never mentioned).
+
+    The clean-tree condition is load-bearing, not a proxy for "the commit
+    landed": an agent-requested restart boots through
+    ``safe_restart(unsynced_policy="rescue_and_block")``, so a dirty tree makes
+    the boot rescue-and-BLOCK and PAUSE the campaign instead of starting the
+    reviewed body. That is why dirt is reported (with its paths) rather than
+    tolerated.
+    """
     if str(ctx.current_task_type or "") != "evolution":
         return ""
     try:
-        status = run_cmd(["git", "status", "--porcelain"], cwd=ctx.repo_dir).strip()
+        # NOT stripped: `git status --porcelain` puts the path at index 3, so
+        # stripping eats the leading space of the FIRST line whenever it is an
+        # unstaged modification (` M path`) — the most common status code — which
+        # drops that path's first character and names a path that does not exist.
+        status = run_cmd(["git", "status", "--porcelain"], cwd=ctx.repo_dir)
         head = run_cmd(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir).strip()
     except Exception as exc:
         return f"could not verify local git durability: {exc}"
     reviewed_sha = str(getattr(ctx, "last_reviewed_commit_sha", "") or "").strip()
-    if reviewed_sha and reviewed_sha == head and not status:
+    reasons: List[str] = []
+    if not reviewed_sha:
+        reasons.append("commit_reviewed has not recorded an exact local commit receipt")
+    elif reviewed_sha != head:
+        reasons.append(
+            "HEAD moved after the last reviewed local commit "
+            f"(reviewed {reviewed_sha[:12]}, live {head[:12] or 'unreadable'})"
+        )
+    if status.strip():
+        reasons.append(
+            "the working tree still holds "
+            f"{_uncommitted_path_summary(status)}, so a restart would rescue-and-block "
+            "them instead of booting the reviewed commit — commit them first, and any "
+            "path this task did not change needs the owner's hand"
+        )
+    if reviewed_sha and reviewed_sha == head:
         metadata = getattr(ctx, "task_metadata", {})
         metadata = metadata if isinstance(metadata, dict) else {}
         tx = metadata.get("evolution_transaction")
@@ -734,15 +799,12 @@ def _evolution_restart_block_reason(ctx: ToolContext) -> str:
             str(getattr(ctx, "task_id", "") or tx.get("task_id") or ""),
             commit_sha=head,
         )
-        return "" if authority.get("ok") else (
-            "the exact evolution commit receipt is no longer active "
-            f"({authority.get('reason') or 'unknown'})"
-        )
-    if not reviewed_sha:
-        return "commit_reviewed has not recorded an exact local commit receipt"
-    if reviewed_sha and reviewed_sha != head:
-        return "HEAD changed after the last reviewed local commit"
-    return "commit_reviewed must create a local reviewed commit before evolution restart"
+        if not authority.get("ok"):
+            reasons.append(
+                "the exact evolution commit receipt is no longer active "
+                f"({authority.get('reason') or 'unknown'})"
+            )
+    return "; ".join(reasons)
 
 
 def _request_restart(ctx: ToolContext, reason: str) -> str:

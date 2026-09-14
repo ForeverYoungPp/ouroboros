@@ -1820,6 +1820,151 @@ def test_restart_requires_the_exact_active_commit_receipt(tmp_path, monkeypatch)
     assert "owner_stopped" in control._evolution_restart_block_reason(ctx)
 
 
+def _porcelain(*entries) -> str:
+    """`git status --porcelain` v1 lines: two status chars, a space, then the path
+    (verified against live git output: `' M ouroboros/tools/control.py'[3:]`).
+    Building the prefix explicitly keeps a fixture from silently dropping it."""
+    return "".join(f"{code} {path}\n" for code, path in entries)
+
+
+def _restart_predicate_ctx(
+    tmp_path, monkeypatch, *, reviewed_sha, head, status,
+    authority_ok=True, authority_reason="owner_stopped",
+):
+    """Hermetic restart-predicate context: git answers are scripted and the
+    authority check is stubbed at its own module, so no state file is touched."""
+    from ouroboros.tools import control
+    from supervisor import evolution_lifecycle
+
+    monkeypatch.setattr(
+        control, "run_cmd",
+        lambda cmd, cwd=None: status if cmd[:2] == ["git", "status"] else head,
+    )
+    monkeypatch.setattr(
+        evolution_lifecycle, "check_evolution_authority",
+        lambda *a, **k: {"ok": authority_ok, "reason": authority_reason},
+    )
+    return SimpleNamespace(
+        current_task_type="evolution",
+        repo_dir=tmp_path,
+        task_id="evo-task",
+        task_metadata={
+            "evolution_transaction": {"campaign_id": "c", "transaction_id": "t"},
+        },
+        last_reviewed_commit_sha=reviewed_sha,
+    )
+
+
+def test_restart_reason_names_the_uncommitted_paths_not_a_missing_receipt(tmp_path, monkeypatch):
+    """Cycle #41's measured refusal. commit cef61b63 was HEAD and the receipt
+    matched it, yet the agent was answered "commit_reviewed must create a local
+    reviewed commit before evolution restart" — a statement that is provably
+    false at that point — and the orphaned payload's dirty paths, the actual
+    blocker, were never named."""
+    from ouroboros.tools import control
+
+    sha = "a" * 40
+    ctx = _restart_predicate_ctx(
+        tmp_path, monkeypatch, reviewed_sha=sha, head=sha,
+        status=_porcelain((" M", "VERSION"), (" M", "README.md"), ("??", "docs/notes.md")),
+    )
+
+    reason = control._evolution_restart_block_reason(ctx)
+
+    assert "must create a local reviewed commit" not in reason
+    assert "3 uncommitted path(s)" in reason
+    for path in ("VERSION", "README.md", "docs/notes.md"):
+        assert path in reason
+    assert "rescue-and-block" in reason
+
+
+def test_restart_reason_discloses_the_omitted_path_count(tmp_path, monkeypatch):
+    """The refusal is bounded AND says it bounded: a listed subset with no
+    omitted count reads as the complete set (BIBLE P1)."""
+    from ouroboros.tools import control
+
+    sha = "b" * 40
+    ctx = _restart_predicate_ctx(
+        tmp_path, monkeypatch, reviewed_sha=sha, head=sha,
+        status=_porcelain(*[(" M", f"f{i}.txt") for i in range(15)]),
+    )
+
+    reason = control._evolution_restart_block_reason(ctx)
+
+    assert "15 uncommitted path(s)" in reason
+    assert f"f{control._RESTART_DIRTY_PATHS_SHOWN - 1}.txt" in reason
+    assert f"f{control._RESTART_DIRTY_PATHS_SHOWN}.txt" not in reason
+    assert f"(+{15 - control._RESTART_DIRTY_PATHS_SHOWN} more)" in reason
+
+
+def test_restart_reason_uses_the_live_path_of_a_rename(tmp_path, monkeypatch):
+    """A rename's source does not exist to be repaired; naming it would send the
+    agent after a path that is already gone."""
+    from ouroboros.tools import control
+
+    sha = "c" * 40
+    ctx = _restart_predicate_ctx(
+        tmp_path, monkeypatch, reviewed_sha=sha, head=sha,
+        status=_porcelain(("R ", "old/name.py -> new/name.py")),
+    )
+
+    reason = control._evolution_restart_block_reason(ctx)
+
+    assert "new/name.py" in reason
+    assert "old/name.py" not in reason
+
+
+def test_restart_reason_keeps_the_first_path_intact(tmp_path, monkeypatch):
+    """The predicate must not strip porcelain output before parsing it. ` M path`
+    is the most common status code, and stripping eats that line's leading space,
+    so the first reported path loses a character and names a file that does not
+    exist — a fix that sends the agent to a phantom path."""
+    from ouroboros.tools import control
+
+    sha = "f" * 40
+    raw = " M ouroboros/tools/control.py"
+    ctx = _restart_predicate_ctx(
+        tmp_path, monkeypatch, reviewed_sha=sha, head=sha, status=raw + "\n",
+    )
+
+    reason = control._evolution_restart_block_reason(ctx)
+
+    assert f"1 uncommitted path(s): {raw[3:]}" in reason
+
+
+def test_restart_reason_names_both_shas_when_head_moved(tmp_path, monkeypatch):
+    from ouroboros.tools import control
+
+    ctx = _restart_predicate_ctx(
+        tmp_path, monkeypatch, reviewed_sha="e" * 40, head="f" * 40, status="",
+    )
+
+    reason = control._evolution_restart_block_reason(ctx)
+
+    assert reason.startswith("HEAD moved after the last reviewed local commit")
+    assert "e" * 12 in reason and "f" * 12 in reason
+
+
+def test_restart_reason_reports_every_failing_condition(tmp_path, monkeypatch):
+    """A dirty tree must not HIDE a dead commit receipt. The predicate checked
+    authority only on its clean branch, so a task holding both facts was handed
+    one cause and would repair the wrong one."""
+    from ouroboros.tools import control
+
+    sha = "d" * 40
+    ctx = _restart_predicate_ctx(
+        tmp_path, monkeypatch, reviewed_sha=sha, head=sha,
+        status=_porcelain((" M", "VERSION")),
+        authority_ok=False, authority_reason="owner_stopped",
+    )
+
+    reason = control._evolution_restart_block_reason(ctx)
+
+    assert "1 uncommitted path(s)" in reason
+    assert "owner_stopped" in reason
+    assert reason.count("; ") == 1
+
+
 def test_boot_restart_verifies_exact_v2_claim_only_after_new_generation(
     tmp_path, monkeypatch,
 ):
@@ -2378,7 +2523,66 @@ def test_supervisor_blocks_restart_when_head_moved_after_receipt(tmp_path):
     )
 
     assert restarted == []
-    assert "no longer matches" in messages[0][1]
+    # The refusal names the mismatch it actually found. The previous text ("the
+    # live checkout no longer matches the exact reviewed evolution commit") was
+    # also sent when the SHA DID match and only the tree was dirty.
+    assert "not the reviewed" in messages[0][1]
+    assert reviewed_sha[:12] in messages[0][1]
+
+
+def test_supervisor_restart_cancel_names_a_dirty_tree_not_a_sha_mismatch(tmp_path):
+    """The reviewed SHA IS live here; only the tree is dirty. The cancelled-restart
+    message must not send the owner looking for a checkout mismatch that does not
+    exist."""
+    import server
+    from supervisor import evolution_lifecycle
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    (repo / "file.txt").write_text("current\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "current"], cwd=repo, check=True, capture_output=True)
+    reviewed_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    campaign, tx = _active_transaction(tmp_path)
+    claim = {
+        "campaign_id": campaign["id"],
+        "transaction_id": tx["transaction_id"],
+        "task_id": tx["task_id"],
+        "commit_sha": reviewed_sha,
+    }
+    assert evolution_lifecycle.record_evolution_commit(
+        campaign["id"], tx["transaction_id"], tx["task_id"], reviewed_sha,
+    )["ok"] is True
+    (repo / "file.txt").write_text("uncommitted edit\n")
+    (tmp_path / "state" / "pending_restart_verify.json").write_text(json.dumps({
+        "reason": "evolution restart",
+        "expected_sha": reviewed_sha,
+        "evolution_claim": claim,
+    }))
+    restarted = []
+    messages = []
+    ctx = SimpleNamespace(
+        DRIVE_ROOT=tmp_path,
+        REPO_DIR=repo,
+        load_state=lambda: {"owner_chat_id": 1},
+        safe_restart=lambda **k: restarted.append(k) or (True, "ok"),
+        send_with_budget=lambda *a: messages.append(a),
+    )
+
+    server._perform_supervisor_restart(
+        ctx, restart_reason="evolution restart", evolution_restart=True,
+    )
+
+    assert restarted == []
+    assert "not provably clean" in messages[0][1]
+    assert "no longer matches" not in messages[0][1]
 
 
 def test_benchmark_seed_creates_campaign_before_enabling(tmp_path):
