@@ -25,7 +25,7 @@ from ouroboros.anthropic_native_custody import (
     scrub_native_custody,
 )
 from ouroboros.openrouter_attribution import OPENROUTER_APP_HEADERS
-from ouroboros.provider_models import OPENROUTER_DEFAULTS, PROVIDER_PREFIXES, normalize_anthropic_model_id, normalize_model_identity, requires_reasoning_content_echo, resolve_minimax_base_url
+from ouroboros.provider_models import OPENROUTER_DEFAULTS, PROVIDER_ENV_KEYS, PROVIDER_PREFIXES, normalize_anthropic_model_id, normalize_model_identity, requires_reasoning_content_echo, resolve_minimax_base_url
 from ouroboros.reasoning_artifacts import sealed_reasoning_pin_fact, transcript_has_sealed_reasoning
 from ouroboros.request_wire_recovery import (
     finalize_wire_response,
@@ -718,6 +718,15 @@ def fetch_cloudru_pricing(*, timeout_sec: float = 5.0) -> Dict[str, Tuple[Option
     except (requests.RequestException, ValueError, KeyError) as e:
         log.warning(f"Failed to fetch cloud.ru pricing: {e}")
         return {}
+
+
+#: Provider -> the settings/env key that carries its credential. ``PROVIDER_ENV_KEYS``
+#: covers the single-key providers; ``openai-compatible`` is added here because its key
+#: lives with its base URL and is read at the openai-compatible branch above.
+_PROVIDER_CREDENTIAL_KEYS: Dict[str, str] = {
+    **PROVIDER_ENV_KEYS,
+    "openai-compatible": "OPENAI_COMPATIBLE_API_KEY",
+}
 
 
 class LLMClient:
@@ -1492,6 +1501,11 @@ class LLMClient:
         # installs the helper returns None and SDK defaults keep proxy mounts.
         from openai import OpenAI
 
+        try:
+            from openai import OpenAIError
+        except ImportError:  # a stub module in tests, or an SDK without it
+            OpenAIError = Exception  # type: ignore[assignment,misc]
+
         from ouroboros.net_transport import keepalive_http_client
 
         kwargs: Dict[str, Any] = {
@@ -1507,7 +1521,24 @@ class LLMClient:
             kwargs["base_url"] = base_url
         if headers:
             kwargs["default_headers"] = headers
-        return OpenAI(**kwargs)
+        try:
+            return OpenAI(**kwargs)
+        except OpenAIError as exc:
+            # The SDK's own missing-credential message names OPENAI_API_KEY no
+            # matter WHICH provider this client was resolved for (measured: the
+            # three shipped-default review seats — google/, openai/ and
+            # anthropic/-prefixed ids that all route through OpenRouter — each
+            # reported "Missing credentials ... OPENAI_API_KEY", pointing the
+            # reader at a key their real route never reads). Same exception
+            # family, so every existing catch keeps working; only the sentence
+            # gains the route it actually failed on.
+            raise type(exc)(
+                f"{exc} [route: provider={target.get('provider') or 'unknown'}"
+                f" model={target.get('usage_model') or target.get('resolved_model') or 'unknown'}"
+                f" base_url={'set' if base_url else 'unset'}"
+                f"; this provider reads "
+                f"{_PROVIDER_CREDENTIAL_KEYS.get(str(target.get('provider') or ''), 'its provider key')}]"
+            ) from exc
 
     def _get_remote_client(self, target: Dict[str, Any]):
         base_url = str(target.get("base_url") or "")

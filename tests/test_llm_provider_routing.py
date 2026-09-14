@@ -1390,3 +1390,31 @@ def test_pin_fact_follows_the_terminal_candidate_not_the_built_one(monkeypatch):
     assert len(sent) == 2
     assert "allow_fallbacks" not in sent[-1].get("extra_body", {}).get("provider", {})
     assert "reasoning_pin" not in usage
+
+
+def test_a_missing_credential_names_the_route_it_actually_failed_on(monkeypatch):
+    """The SDK's message names OPENAI_API_KEY whatever provider this was.
+
+    Measured 2026-09-14: all three shipped-default review seats — `google/…`,
+    `openai/…` and `anthropic/…` ids, which all resolve to provider ``openrouter`` —
+    reported the identical sentence "Missing credentials ... OPENAI_API_KEY", pointing
+    the reader at a key their real route never reads. The re-raise keeps the exception
+    family (so every existing catch still works) and appends the resolved route.
+    """
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_COMPATIBLE_API_KEY", raising=False)
+
+    client = LLMClient()
+    for model, provider, key_name in (
+        ("google/gemini-3.7-flash", "openrouter", "OPENROUTER_API_KEY"),
+        ("openai-compatible::deepseek-flash", "openai-compatible", "OPENAI_COMPATIBLE_API_KEY"),
+    ):
+        target = client._resolve_remote_target(model)
+        assert target["provider"] == provider
+        with pytest.raises(Exception) as excinfo:
+            client._new_remote_client(target)
+        message = str(excinfo.value)
+        assert "Missing credentials" in message, "precondition: the SDK refused first"
+        assert f"provider={provider}" in message
+        assert key_name in message, "the sentence must name the key this route reads"
+        assert model.split("::")[-1] in message
