@@ -2303,20 +2303,31 @@ def _inject_round_checkpoints(
     return bool(checkpoint or time_budget or cost_budget or nanny_economics)
 
 
+#: How many cache anchors one transcript may carry. Providers cap cache breakpoints
+#: (Anthropic: 4 per request), so the count is bounded — but an OLD anchor is what holds
+#: a cached prefix, so the cap stops NEW anchors and never retires one.
+MAX_TRANSCRIPT_SEALS = 3
+
+
 def seal_task_transcript(
     messages: List[Dict[str, Any]],
     keep_active: int = 5,
     min_prefix_tokens: int = 2048,
+    max_seals: int = MAX_TRANSCRIPT_SEALS,
 ) -> None:
-    """Mark one stable old tool-result boundary for provider prompt caching."""
-    for msg in messages:
-        if msg.get("role") != "tool":
-            continue
-        content = msg.get("content")
-        if isinstance(content, list):
-            # Flatten the old sealed boundary before choosing a new one.
-            msg["content"] = _extract_plain_text_from_content(content)
+    """Mark a stable tool-result boundary for provider prompt caching — APPEND-ONLY.
 
+    Measured 2026-09-14 (evolution task 79cd720f, round 6): this function used to
+    FLATTEN every sealed boundary and then seal a new one, and the boundary moves
+    forward as tool results arrive. Rewriting an old message's content rewrites its
+    serialized bytes, so the wire prefix diverged at the OLD anchor and every byte after
+    it was re-sent uncached — 25,765 prompt tokens on that round alone (~18% of the
+    task's total uncached input), repeating on every move. Marking a LATER message
+    cannot disturb an earlier prefix, so anchors are only ever ADDED: the oldest ones
+    keep the prefix they hold, new ones extend it, and once the breakpoint budget is
+    spent this stops (the newest tail stays uncached, which the ``keep_active`` window
+    already accepts).
+    """
     tool_indices = [
         i for i, m in enumerate(messages)
         if m.get("role") == "tool"
@@ -2324,7 +2335,20 @@ def seal_task_transcript(
     if len(tool_indices) <= keep_active:
         return
 
+    already_sealed = {
+        i for i, m in enumerate(messages)
+        if m.get("role") == "tool"
+        and isinstance(m.get("content"), list)
+        and any(isinstance(block, dict) and block.get("cache_control") for block in m["content"])
+    }
+    if len(already_sealed) >= max(1, int(max_seals)):
+        return
+
     seal_candidate_idx = tool_indices[-(keep_active + 1)]
+    if seal_candidate_idx in already_sealed:
+        # This window is already anchored; re-sealing it (or moving it) would rewrite
+        # bytes the cache is holding.
+        return
 
     prefix_text_len = sum(
         len(_extract_plain_text_from_content(m.get("content", "")))

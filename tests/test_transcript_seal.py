@@ -126,8 +126,14 @@ def test_sealed_text_matches_original():
 # seal_task_transcript — rotation and revert
 # ─────────────────────────────────────────────────────────────
 
-def test_seal_rotates_forward_on_second_call():
-    """When new tool rounds are added, the seal boundary advances."""
+def test_seal_adds_a_forward_anchor_without_touching_the_first():
+    """Anchors are APPEND-ONLY: the old one keeps its prefix, a new one extends it.
+
+    Measured 2026-09-14 (task 79cd720f round 6): the old rotate-and-flatten shape
+    rewrote the previous anchor's bytes, so the wire prefix diverged there and the whole
+    tail was re-read uncached — 25,765 tokens in one round. The previous pin asserted
+    the rotation; this one asserts the property that made it expensive to lose.
+    """
     msgs = _make_messages(n_tool_rounds=7, prefix_per_tool=3000)
     seal_task_transcript(msgs, keep_active=5, min_prefix_tokens=100)
     first_sealed_idx = _sealed_indices(msgs)[0]
@@ -137,12 +143,17 @@ def test_seal_rotates_forward_on_second_call():
     msgs.append(_tool_msg("new_result" * 500, call_id="tc_new"))
 
     seal_task_transcript(msgs, keep_active=5, min_prefix_tokens=100)
-    second_sealed_idx = _sealed_indices(msgs)[0]
-    assert second_sealed_idx > first_sealed_idx
+    sealed = _sealed_indices(msgs)
+    assert len(sealed) == 2, "the new anchor is ADDED, never rotated onto the old slot"
+    assert max(sealed) > first_sealed_idx
+    assert first_sealed_idx in sealed, "the old anchor still holds the prefix it cached"
 
 
-def test_previous_seal_reverted_on_recompute():
-    """After a second call, the previously sealed message is plain string again."""
+def test_previous_seal_is_preserved_on_recompute():
+    """After a second call, the previously sealed message KEEPS its marker.
+
+    Reverting it to a plain string is exactly the byte rewrite that broke the prefix.
+    """
     msgs = _make_messages(n_tool_rounds=7, prefix_per_tool=3000)
     seal_task_transcript(msgs, keep_active=5, min_prefix_tokens=100)
     first_sealed_idx = _sealed_indices(msgs)[0]
@@ -153,17 +164,30 @@ def test_previous_seal_reverted_on_recompute():
 
     seal_task_transcript(msgs, keep_active=5, min_prefix_tokens=100)
 
-    # The previously sealed message must now be a plain string
-    assert isinstance(msgs[first_sealed_idx]["content"], str)
+    # The previously sealed message must keep its marker (list content).
+    assert isinstance(msgs[first_sealed_idx]["content"], list)
+    assert msgs[first_sealed_idx]["content"][0]["cache_control"] == {"type": "ephemeral"}
 
 
-def test_only_one_sealed_boundary_at_a_time():
-    """There is at most one sealed tool message at any point."""
+def test_anchors_stop_at_the_breakpoint_budget_without_retiring_one():
+    """The cap stops NEW anchors; it never rewrites an old one away."""
     msgs = _make_messages(n_tool_rounds=10, prefix_per_tool=3000)
-    # Call twice to simulate two consecutive LLM rounds
     seal_task_transcript(msgs, keep_active=5, min_prefix_tokens=100)
+    first = _sealed_indices(msgs)[0]
+    msgs.append(_assistant_msg("one more"))
+    msgs.append(_tool_msg("x" * 3000, call_id="tc_more"))
     seal_task_transcript(msgs, keep_active=5, min_prefix_tokens=100)
-    assert len(_sealed_indices(msgs)) <= 1
+    assert len(_sealed_indices(msgs)) == 2
+
+    # A spent budget stops the NEXT anchor and leaves the existing ones untouched.
+    msgs2 = _make_messages(n_tool_rounds=10, prefix_per_tool=3000)
+    seal_task_transcript(msgs2, keep_active=5, min_prefix_tokens=100, max_seals=1)
+    before = list(_sealed_indices(msgs2))
+    msgs2.append(_assistant_msg("one more"))
+    msgs2.append(_tool_msg("x" * 3000, call_id="tc_more"))
+    seal_task_transcript(msgs2, keep_active=5, min_prefix_tokens=100, max_seals=1)
+    assert _sealed_indices(msgs2) == before, "at the budget, nothing is added or removed"
+    assert before == [first], "and the anchor itself never moves"
 
 
 # ─────────────────────────────────────────────────────────────
