@@ -862,6 +862,68 @@ def test_cleanup_never_rewinds_the_branch_behind_its_published_line(tmp_path):
     assert branches == ""
 
 
+def test_cleanup_stashes_the_leftovers_it_declines_to_rewind(tmp_path):
+    """The published-line refusal covers HISTORY, not this cycle's dirty files.
+
+    Measured 2026-09-14 (live drive): cycle 55's cleanup refused the rewind after the
+    branch's published line had moved, and left that cycle's uncommitted work in the
+    tree. The next cycle then found a dirty base predicate and spent its run on a
+    no_op/interrupted record instead of the work — 'skipped' quietly became 'stuck'.
+    A stash moves no ref, so the two decisions are independent: HEAD stays where the
+    published line left it, the files stay recoverable, the tree comes back clean, and
+    the transaction says which of the two it did.
+    """
+    import subprocess
+
+    from supervisor import git_ops, queue
+
+    repo = tmp_path / "repo"
+    _git = _make_git_repo(repo)
+    base_head = _git("rev-parse", "HEAD").stdout.strip()
+
+    (repo / "published.txt").write_text("published\n", encoding="utf-8")
+    _git("add", ".")
+    _git("commit", "-m", "published line")
+    git_ops.init(repo, tmp_path, "")
+    _publish_upstream(repo, tmp_path / "origin.git")
+    subprocess.run(
+        ["git", "-C", str(repo), "reset", "--hard", base_head],
+        check=True, capture_output=True, text=True,
+    )
+    (repo / "landing.txt").write_text("manual landing\n", encoding="utf-8")
+    _git("add", ".")
+    _git("commit", "-m", "fix: manual landing")
+    landed = _git("rev-parse", "HEAD").stdout.strip()
+    (repo / "cycle_leftover.txt").write_text("uncommitted cycle work\n", encoding="utf-8")
+
+    queue.init(tmp_path, 600, 1800)
+    queue.RUNNING.clear()
+    tx = {"transaction_id": "tx-dirty-published", "base_head": base_head}
+    lifecycle._cleanup_worktree_after_cycle(tx, "task-dirty-published")
+
+    assert tx["cleanup_status"] == "stashed_behind_upstream"
+    assert "stashed as" in tx["recovery_hint"] and "origin/ouroboros" in tx["recovery_hint"]
+    # The history decision is untouched: the landing is still the tip.
+    assert _git("rev-parse", "HEAD").stdout.strip() == landed
+    branches = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--list", "evolution-leftover-*"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    assert branches == "", "a stash must not create a leftover ref"
+    # The files decision went the other way: the work is recoverable, the tree is clean.
+    stashes = subprocess.run(
+        ["git", "-C", str(repo), "stash", "list"], capture_output=True, text=True
+    ).stdout.strip()
+    assert "evolution-cycle-cleanup-tx-dirty-published" in stashes
+    assert not (repo / "cycle_leftover.txt").exists()
+    # An untracked file lands in the stash's third parent, so read it there.
+    restored = subprocess.run(
+        ["git", "-C", str(repo), "ls-tree", "-r", "--name-only", "stash@{0}^3"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    assert "cycle_leftover.txt" in restored
+
+
 def test_cleanup_still_rewinds_an_unpublished_leftover_with_an_upstream(tmp_path):
     """The published-line guard must not disable the cleanup's own case: an
     unreviewed local leftover above an up-to-date base is still stashed and

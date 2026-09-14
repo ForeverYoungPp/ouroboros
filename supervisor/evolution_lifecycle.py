@@ -899,23 +899,12 @@ def _cleanup_worktree_after_cycle(tx: Dict[str, Any], task_id: str) -> None:
             tx["cleanup_status"] = "already_clean"
             return
 
-        if head != base_head:
-            rewind_safe, upstream_ref = _rewind_is_safe_against_published_line(base_head)
-            if not rewind_safe:
-                # The branch tip is no longer this transaction's private
-                # workspace: resetting to base_head would leave the LOCAL branch
-                # behind its published line. Touch nothing — not even the stash —
-                # and say so (P1: a moved published line outranks our tidy base).
-                tx["cleanup_status"] = "skipped_behind_upstream"
-                tx["cleanup_head"] = head
-                tx["recovery_hint"] = (
-                    f"HEAD {head[:12]} is not this cycle's commit and {upstream_ref} is not an "
-                    f"ancestor of base {base_head[:12]}: resetting would leave the branch behind "
-                    "its published line. Left as-is (nothing stashed, nothing reset); reconcile "
-                    "the branch with its upstream before the next cycle."
-                )
-                return
-
+        # The leftovers are saved BEFORE the published-line question is asked, because the
+        # two decisions are independent: whether to move HEAD is about history, whether to
+        # stash is about this cycle's unreviewed files. A stash keeps them recoverable and
+        # leaves the tree clean for the next cycle's clean-base predicate; it moves no ref.
+        # (Until 6.114.47 the stash lived inside the safe branch only, so an unsafe branch
+        # left those files to rot in a tree the next cycle then refused to run in.)
         if dirty:
             stash_label = f"evolution-cycle-cleanup-{tx.get('transaction_id') or task_id}"
             rc_stash, _, stash_err = git_ops.git_capture(
@@ -932,6 +921,33 @@ def _cleanup_worktree_after_cycle(tx: Dict[str, Any], task_id: str) -> None:
                 )
                 return
             tx["cleanup_stash"] = stash_label
+
+        if head != base_head:
+            rewind_safe, upstream_ref = _rewind_is_safe_against_published_line(base_head)
+            if not rewind_safe:
+                # The branch tip is no longer this transaction's private
+                # workspace: resetting to base_head would leave the LOCAL branch
+                # behind its published line. Touch no REF and do not move HEAD
+                # (P1: a moved published line outranks our tidy base) — but the
+                # dirty files are still saved above, because a stash ties nothing
+                # to the branch's history.
+                tx["cleanup_status"] = (
+                    "stashed_behind_upstream" if tx.get("cleanup_stash") else "skipped_behind_upstream"
+                )
+                tx["cleanup_head"] = head
+                tx["recovery_hint"] = (
+                    f"HEAD {head[:12]} is not this cycle's commit and {upstream_ref} is not an "
+                    f"ancestor of base {base_head[:12]}: resetting would leave the branch behind "
+                    "its published line. "
+                    + (
+                        f"Left as-is; this cycle's dirty files were stashed as {tx['cleanup_stash']} "
+                        "(nothing else touched). "
+                        if tx.get("cleanup_stash")
+                        else "Left as-is (nothing stashed, nothing reset); "
+                    )
+                    + "reconcile the branch with its upstream before the next cycle."
+                )
+                return
 
         if head != base_head:
             preserved, ref_name = git_ops.preserve_local_ref_branch("HEAD", prefix="evolution-leftover")
